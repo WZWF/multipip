@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "\u591a\u7a97\u64ad\u653e Multi-PiP",
+  "version": "0.9.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsrntP6in84G9SuAUyLKqZ4zO1GZhi+dSpPmVEJ8YVssf7gROyRbj+X2V5aK5YFpMkbMRne1OudxVjuFJgyjJAbsw08obZWMU2YHqEe3hYd/3Y+3c57aecJutqYWXBHJTWDGNlk/XWNiq/UL0A7/RmQby8Voe5Kywy4HbusRxi2P3yPfX0ifIIye0wVJb7EV+jhr9FtTHzJrr14sCnFtVDff5S6Q/5CBh77+Hdi6fJWIuU40K7jZUWLnubBaNx8H/R/PCZnLNu3FWbxBGTcRWe5gkANRZk9vFyLDQ6AWGXcikWhQicqTv1Y5SEd0Px/MXNe5BykIEy0d8mwoR7MBCBQIDAQAB",
+  "description": "\u628a\u7f51\u9875\u4e2d\u4efb\u610f\u89c6\u9891\u5f39\u51fa\u4e3a\u7a97\u53e3\uff1a\u539f\u751f\u5c0f\u7a97\uff08\u591a\u89c6\u9891\u7f6e\u9876\u575e\u3001\u8de8\u6807\u7b7e\u9875\u5408\u5e76\u3001\u4e94\u79cd\u5e03\u5c40\uff09\u3001\u539f\u751f\u753b\u4e2d\u753b\uff08\u7f6e\u9876\uff09\u3001\u65e0\u8fb9\u6846\u539f\u751f\u7a97\uff08\u7f6e\u9876\u591a\u5f00\u3001\u591a\u7a97\u4e00\u952e\u6392\u7248\u3001\u5916\u6302\u5b57\u5e55\uff09\u3002\u9762\u677f/\u5feb\u6377\u952e Alt+Shift+S \u8c03\u500d\u901f\u3002",
+  "minimum_chrome_version": "116",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "\u591a\u7a97\u64ad\u653e Multi-PiP"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["nativeMessaging", "windows"],
+  "commands": {
+    "mp-cycle-speed": {
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
+      "description": "\u5faa\u73af\u5207\u6362\u5f53\u524d\u89c6\u9891\u500d\u901f"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}
