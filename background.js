@@ -41,6 +41,8 @@ let companionNextId = 1;
 /* ------------------------- core message handling ------------------------- */
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // 严格校验消息来源必须为本扩展自身，拒绝任何外部扩展或异常上下文伪造调用
+  if (!sender || sender.id !== chrome.runtime.id) return false;
   if (!msg || typeof msg.type !== 'string') return false;
   if (msg.type.indexOf('mp-') !== 0) return false;
 
@@ -212,7 +214,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'mp-companion-signal') {
     const entry = companionWindows.get(msg.id);
-    if (entry) {
+    const allowedCmds = { 'rtc-offer': true, 'rtc-ice': true, 'meta-sync': true };
+    if (entry && msg.data && allowedCmds[msg.data.cmd]) {
       try {
         entry.port.postMessage(msg.data);
       } catch (e) {}
@@ -331,12 +334,10 @@ function companionOpen(msg, sender) {
       port.postMessage({
         cmd: 'open',
         id,
-        url: msg.url,
-        html: msg.html,
-        width: msg.width,
-        height: msg.height,
-        x: msg.x,
-        y: msg.y,
+        width: Math.max(160, Math.min(4096, Number(msg.width) || 480)),
+        height: Math.max(90, Math.min(2160, Number(msg.height) || 270)),
+        x: typeof msg.x === 'number' ? Math.round(msg.x) : undefined,
+        y: typeof msg.y === 'number' ? Math.round(msg.y) : undefined,
       });
     } catch (e) {
       companionWindows.delete(id);

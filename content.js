@@ -98,7 +98,27 @@
       });
     };
     walk(root);
-    return result;
+    // 过滤零尺寸/无源的隐藏占位 video，并将正在播放或面积最大的主视频排在最前面
+    const valid = result.filter((v) => {
+      if (homes.has(v) || nativePopped.has(v) || companionPopped.has(v) || dockCrossPopped.has(v)) return true;
+      const r = v.getBoundingClientRect ? v.getBoundingClientRect() : { width: 0, height: 0 };
+      const hasMedia = (v.videoWidth > 0 && v.videoHeight > 0) || v.readyState > 0 || Boolean(v.currentSrc || v.src || v.srcObject);
+      const isVisible = r.width >= 40 && r.height >= 24;
+      return hasMedia || isVisible;
+    });
+    valid.sort((a, b) => {
+      const score = (v) => {
+        let s = 0;
+        if (!v.paused && v.readyState >= 2) s += 1e9;
+        if (v.videoWidth > 0 && v.videoHeight > 0) s += v.videoWidth * v.videoHeight * 100;
+        const r = v.getBoundingClientRect ? v.getBoundingClientRect() : { width: 0, height: 0 };
+        if (r.width > 0 && r.height > 0) s += r.width * r.height;
+        if (Number.isFinite(v.duration) && v.duration > 0) s += 1e5;
+        return s;
+      };
+      return score(b) - score(a);
+    });
+    return valid;
   }
 
   /* ------------------------ pop / restore core ------------------------ */
@@ -371,14 +391,103 @@
     }
   }
 
+  /** 为本地回环 WebRTC 补充 127.0.0.1 / ::1 候选地址，避免系统防火墙或虚拟网卡拦截 .local mDNS 导致黑屏无声 */
+  function expandLoopbackCandidates(candObj) {
+    if (!candObj || typeof candObj.candidate !== 'string') return [candObj];
+    const list = [candObj];
+    const str = candObj.candidate;
+    const m = str.match(/^(candidate:\S+\s+\d+\s+udp\s+\d+\s+)([^\s]+)(\s+\d+\s+typ\s+host.*)$/i);
+    if (m) {
+      const addr = m[2];
+      if (addr !== '127.0.0.1' && addr !== '::1') {
+        list.push(Object.assign({}, candObj, { candidate: m[1] + '127.0.0.1' + m[3] }));
+        list.push(Object.assign({}, candObj, { candidate: m[1] + '::1' + m[3] }));
+      }
+    }
+    return list;
+  }
+
+  /** 为本地回环 WebRTC 解锁原画质高码率与 1:1 原始分辨率，消除默认 360p/1.7Mbps 带宽限制导致的画面模糊 */
+  function boostWebRtcVideoSdp(sdp) {
+    if (!sdp || typeof sdp !== 'string') return sdp;
+    const lines = sdp.split('\r\n');
+    const out = [];
+    let inVideo = false;
+    const videoPts = new Set();
+    const hasFmtp = new Set();
+    for (const line of lines) {
+      if (line.indexOf('m=') === 0) inVideo = line.indexOf('m=video') === 0;
+      if (inVideo) {
+        const m = line.match(/^a=rtpmap:(\d+)\s+(VP9|VP8|H264|AV1)\/90000/i);
+        if (m) videoPts.add(m[1]);
+      }
+    }
+    for (const line of lines) {
+      const fm = line.match(/^a=fmtp:(\d+)\s+/);
+      if (fm && videoPts.has(fm[1])) hasFmtp.add(fm[1]);
+    }
+    inVideo = false;
+    const br = 'x-google-min-bitrate=8000;x-google-start-bitrate=20000;x-google-max-bitrate=35000';
+    for (const line of lines) {
+      if (line.indexOf('m=') === 0) inVideo = line.indexOf('m=video') === 0;
+      if (inVideo && line.indexOf('c=IN ') === 0) {
+        out.push(line);
+        out.push('b=AS:35000');
+        continue;
+      }
+      const fm = line.match(/^a=fmtp:(\d+)\s+(.*)$/);
+      if (inVideo && fm && videoPts.has(fm[1])) {
+        if (fm[2].indexOf('x-google-max-bitrate') < 0) {
+          out.push('a=fmtp:' + fm[1] + ' ' + fm[2] + ';' + br);
+        } else {
+          out.push(line);
+        }
+        continue;
+      }
+      out.push(line);
+      const rm = line.match(/^a=rtpmap:(\d+)\s+/);
+      if (inVideo && rm && videoPts.has(rm[1]) && !hasFmtp.has(rm[1])) {
+        out.push('a=fmtp:' + rm[1] + ' ' + br);
+      }
+    }
+    return out.join('\r\n');
+  }
+
+  function applyHighQualityRtcSenders(pc) {
+    if (!pc || typeof pc.getSenders !== 'function') return;
+    pc.getSenders().forEach((sender) => {
+      try {
+        if (sender.track && sender.track.kind === 'video' && typeof sender.getParameters === 'function') {
+          const params = sender.getParameters() || {};
+          params.degradationPreference = 'maintain-resolution';
+          if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+          params.encodings[0].maxBitrate = 35000000;
+          params.encodings[0].scaleResolutionDownBy = 1.0;
+          params.encodings[0].maxFramerate = 60;
+          const p = sender.setParameters(params);
+          if (p && p.catch) p.catch(() => {});
+        }
+      } catch (e) {}
+    });
+  }
+
+  function prepareHighQualityStream(stream) {
+    if (!stream || typeof stream.getVideoTracks !== 'function') return;
+    stream.getVideoTracks().forEach((vt) => {
+      try {
+        if ('contentHint' in vt) vt.contentHint = 'detail';
+      } catch (e) {}
+    });
+  }
+
   /** Companion mode: REAL frameless always-on-top window using local WebRTC streaming.
    *  Directly captures the video stream via local WebRTC, 100% immune to network proxy,
    *  cookies, and CORS issues. */
   async function popOutCompanion(video) {
     let stream = null;
     try {
-      if (typeof video.captureStream === 'function') stream = video.captureStream(30);
-      else if (typeof video.mozCaptureStream === 'function') stream = video.mozCaptureStream(30);
+      if (typeof video.captureStream === 'function') stream = video.captureStream();
+      else if (typeof video.mozCaptureStream === 'function') stream = video.mozCaptureStream();
     } catch (e) {
       log('companion captureStream error:', e);
     }
@@ -388,6 +497,7 @@
       toast('\u65e0\u6cd5\u83b7\u53d6\u8be5\u89c6\u9891\u7684\u753b\u9762\u6d41\uff0c\u53ef\u80fd\u53d7\u6d4f\u89c8\u5668\u5b89\u5168\u7b56\u7565\u9650\u5236');
       return;
     }
+    prepareHighQualityStream(stream);
 
     const size = guessWindowSize([video]);
     const resp = await bgSend({
@@ -405,6 +515,8 @@
     const winId = resp.id;
     companionPopped.set(video, winId);
     lastPopped = video;
+    protectSourceVideo(video);
+    playSourceVideo(video);
     hideCrossSourceVideo(video);
     refreshStates();
     log('companion window opened, id:', winId);
@@ -412,34 +524,7 @@
     // 建立本地 WebRTC PeerConnection 直推至伴侣窗口
     const pc = new RTCPeerConnection({ iceServers: [] });
     stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        bgSend({
-          type: 'mp-companion-signal',
-          id: winId,
-          data: {
-            cmd: 'rtc-ice',
-            candidate: typeof e.candidate.toJSON === 'function' ? e.candidate.toJSON() : {
-              candidate: e.candidate.candidate,
-              sdpMid: e.candidate.sdpMid,
-              sdpMLineIndex: e.candidate.sdpMLineIndex,
-            }
-          }
-        });
-      }
-    };
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    bgSend({
-      type: 'mp-companion-signal',
-      id: winId,
-      data: {
-        cmd: 'rtc-offer',
-        offer: { type: offer.type, sdp: offer.sdp }
-      }
-    });
+    const iceCandidates = [];
 
     // 状态同步定时器
     const syncTimer = setInterval(() => {
@@ -461,7 +546,57 @@
       });
     }, 250);
 
-    companionConnections.set(winId, { pc, video, syncTimer });
+    const connEntry = { pc, video, stream, syncTimer, iceCandidates, answerReceived: false, retryTimer: null };
+    companionConnections.set(winId, connEntry);
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        const rawCand = typeof e.candidate.toJSON === 'function' ? e.candidate.toJSON() : {
+          candidate: e.candidate.candidate,
+          sdpMid: e.candidate.sdpMid,
+          sdpMLineIndex: e.candidate.sdpMLineIndex,
+        };
+        expandLoopbackCandidates(rawCand).forEach((cand) => {
+          iceCandidates.push(cand);
+          bgSend({
+            type: 'mp-companion-signal',
+            id: winId,
+            data: {
+              cmd: 'rtc-ice',
+              candidate: cand
+            }
+          });
+        });
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const offerPayload = {
+      cmd: 'rtc-offer',
+      offer: { type: offer.type, sdp: offer.sdp }
+    };
+    bgSend({
+      type: 'mp-companion-signal',
+      id: winId,
+      data: offerPayload
+    });
+
+    // 若伴侣窗 WebView2 尚未完成 pywebviewready 初始化，首次信号可能被丢弃；自动重发直至收到 answer
+    let retryCount = 0;
+    connEntry.retryTimer = setInterval(() => {
+      if (!companionPopped.has(video) || connEntry.answerReceived || retryCount >= 8) {
+        clearInterval(connEntry.retryTimer);
+        connEntry.retryTimer = null;
+        return;
+      }
+      retryCount++;
+      bgSend({
+        type: 'mp-companion-signal',
+        id: winId,
+        data: offerPayload
+      });
+    }, 600);
   }
 
   function recallCompanion(video) {
@@ -469,9 +604,14 @@
     if (id == null) return;
     companionPopped.delete(video);
     restoreCrossSourceVideo(video);
+    unprotectSourceVideo(video);
     const conn = companionConnections.get(id);
     if (conn) {
       if (conn.syncTimer) clearInterval(conn.syncTimer);
+      if (conn.retryTimer) clearInterval(conn.retryTimer);
+      if (conn.stream && conn.stream.getTracks) {
+        conn.stream.getTracks().forEach((t) => { try { t.stop(); } catch (e) {} });
+      }
       try { conn.pc.close(); } catch (e) {}
       companionConnections.delete(id);
     }
@@ -1342,6 +1482,10 @@
 
   /** Embed card: an iframe hosting the source site's player (cross-tab merge). */
   function addEmbedCard(d, url, meta, fromTab) {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+      log('rejected unsafe embed url');
+      return null;
+    }
     const doc = d.doc;
     const slot = doc.createElement('div');
     slot.setAttribute('data-mslot', '1');
@@ -1440,10 +1584,10 @@
     const origPause = video.pause;
     video._mpOrigPause = origPause;
     video.pause = function() {
-      if (video._mpAllowPause || !dockCrossPopped.has(video)) {
+      if (video._mpAllowPause || (!dockCrossPopped.has(video) && !companionPopped.has(video))) {
         return origPause.apply(this, arguments);
       }
-      log('prevented background tab auto-pause on cross-popped video');
+      log('prevented background tab auto-pause on popped video');
     };
   }
 
@@ -1513,7 +1657,8 @@
       userSelect: 'none',
     });
     placeholder.addEventListener('click', () => {
-      recallCrossDock(video);
+      if (companionPopped.has(video)) recallCompanion(video);
+      else recallCrossDock(video);
     });
 
     const parent = video.parentNode;
@@ -1566,8 +1711,8 @@
 
     let stream = null;
     try {
-      if (typeof video.captureStream === 'function') stream = video.captureStream(30);
-      else if (typeof video.mozCaptureStream === 'function') stream = video.mozCaptureStream(30);
+      if (typeof video.captureStream === 'function') stream = video.captureStream();
+      else if (typeof video.mozCaptureStream === 'function') stream = video.mozCaptureStream();
     } catch (e) {
       log('captureStream error:', e);
     }
@@ -1580,6 +1725,7 @@
       popOutEmbed(video);
       return;
     }
+    prepareHighQualityStream(stream);
 
     const connId = nextDockSourceId++;
     const pc = new RTCPeerConnection({ iceServers: [] });
@@ -1593,15 +1739,18 @@
 
     pc.onicecandidate = (e) => {
       if (e.candidate && dockOwnerId != null) {
-        bgSend({
-          type: 'mp-rtc-ice',
-          toTab: dockOwnerId,
-          connId,
-          candidate: typeof e.candidate.toJSON === 'function' ? e.candidate.toJSON() : {
-            candidate: e.candidate.candidate,
-            sdpMid: e.candidate.sdpMid,
-            sdpMLineIndex: e.candidate.sdpMLineIndex,
-          },
+        const rawCand = typeof e.candidate.toJSON === 'function' ? e.candidate.toJSON() : {
+          candidate: e.candidate.candidate,
+          sdpMid: e.candidate.sdpMid,
+          sdpMLineIndex: e.candidate.sdpMLineIndex,
+        };
+        expandLoopbackCandidates(rawCand).forEach((cand) => {
+          bgSend({
+            type: 'mp-rtc-ice',
+            toTab: dockOwnerId,
+            connId,
+            candidate: cand,
+          });
         });
       }
     };
@@ -1812,7 +1961,17 @@
   const badges = new Map();
   let rafId = 0;
   let currentVideo = null;
-  let badgeTimer = 0;
+  let cachedVideos = [];
+  let cachedVideosAt = 0;
+
+  function getCachedVideos() {
+    const now = Date.now();
+    if (now - cachedVideosAt > 1000) {
+      cachedVideos = collectVideos();
+      cachedVideosAt = now;
+    }
+    return cachedVideos;
+  }
 
   function ensureBadge(video) {
     let b = badges.get(video);
@@ -1827,18 +1986,29 @@
       padding: '4px 10px',
       borderRadius: '8px',
       whiteSpace: 'nowrap',
-      background: 'rgba(12,12,20,.88)',
+      background: 'rgba(12,12,20,.78)',
+      backdropFilter: 'blur(6px)',
       color: '#fff',
       font: '12px/1.5 system-ui, "Microsoft YaHei", sans-serif',
       border: '1px solid rgba(255,255,255,.2)',
-      boxShadow: '0 2px 12px rgba(0,0,0,.45)',
+      boxShadow: '0 2px 12px rgba(0,0,0,.35)',
       userSelect: 'none',
+      opacity: '0',
+      transition: 'opacity .15s ease',
     });
-    b.addEventListener('mouseenter', () => { b.dataset.hover = '1'; });
-    b.addEventListener('mouseleave', () => { b.dataset.hover = ''; });
+    b.addEventListener('mouseenter', () => {
+      b.dataset.hover = '1';
+      b.style.background = 'rgba(109,92,255,.92)';
+    });
+    b.addEventListener('mouseleave', () => {
+      b.dataset.hover = '';
+      b.style.background = 'rgba(12,12,20,.78)';
+      hideBadge(b);
+    });
     b.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
+      hideBadge(b);
       popOut(video);
     });
     overlay.appendChild(b);
@@ -1846,17 +2016,53 @@
     return b;
   }
 
-  function hideAllBadges(except) {
-    for (const [v, b] of badges) {
-      if (v !== except) b.style.display = 'none';
+  function showBadge(b) {
+    if (b.style.display === 'none') {
+      b.style.display = 'block';
+      requestAnimationFrame(() => { b.style.opacity = '1'; });
+    } else {
+      b.style.opacity = '1';
     }
   }
 
-  function videoFromEvent(e) {
-    const path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
-    for (const node of path) {
-      if (node && node.tagName === 'VIDEO') return node;
-      if (node && node.id && node.id.indexOf(NS) === 0) return null; // our own UI
+  function hideBadge(b) {
+    b.style.opacity = '0';
+    b.style.display = 'none';
+  }
+
+  function hideAllBadges(except) {
+    for (const [v, b] of badges) {
+      if (v !== except && b.dataset.hover !== '1') hideBadge(b);
+    }
+  }
+
+  function isVideoPopped(v) {
+    return homes.has(v) || nativePopped.has(v) || companionPopped.has(v) || dockCrossPopped.has(v);
+  }
+
+  /** 仅当鼠标真正移入有效视频画面的「右上角小热区」时才返回该视频；
+   *  全屏播放、已弹出视频、过小预览缩略图或鼠标在视频中央/进度条区域时一律返回 null */
+  function findTopRightCornerVideo(clientX, clientY) {
+    if (document.fullscreenElement || document.webkitFullscreenElement) return null;
+    const list = getCachedVideos();
+    for (let i = 0; i < list.length; i++) {
+      const v = list[i];
+      if (!v.isConnected || isVideoPopped(v)) continue;
+      const r = v.getBoundingClientRect();
+      // 过滤过小的封面动图、表情包或微小预览视频
+      if (r.width < 220 || r.height < 130) continue;
+      if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) continue;
+      // 右上角热区：距右边缘 128px 以内、距上边缘 54px 以内
+      const zoneW = Math.min(128, r.width * 0.35);
+      const zoneH = Math.min(54, r.height * 0.3);
+      if (
+        clientX >= r.right - zoneW &&
+        clientX <= r.right &&
+        clientY >= r.top &&
+        clientY <= r.top + zoneH
+      ) {
+        return v;
+      }
     }
     return null;
   }
@@ -1866,72 +2072,141 @@
     let anyVisible = false;
     for (const [v, b] of badges) {
       if (b.style.display === 'none') continue;
+      if (document.fullscreenElement || isVideoPopped(v)) {
+        hideBadge(b);
+        continue;
+      }
       const r = v.getBoundingClientRect();
       if (
-        r.width < 40 || r.height < 24 ||
+        r.width < 220 || r.height < 130 ||
         r.bottom < 0 || r.top > innerHeight ||
         r.right < 0 || r.left > innerWidth
       ) {
-        b.style.display = 'none'; // video was popped / scrolled away
+        hideBadge(b);
         continue;
       }
-      const bw = b.offsetWidth || 90;
-      b.style.left = Math.max(4, Math.round(r.right - bw - 8)) + 'px';
-      b.style.top = Math.round(r.top + 8) + 'px';
+      const bw = b.offsetWidth || 72;
+      b.style.left = Math.max(4, Math.round(r.right - bw - 10)) + 'px';
+      b.style.top = Math.round(r.top + 10) + 'px';
       anyVisible = true;
     }
     if (anyVisible) rafId = requestAnimationFrame(trackBadges);
   }
 
-  document.addEventListener('mouseover', (e) => {
-    const v = videoFromEvent(e);
-    currentVideo = v || null;
-    if (!v) return;
-    const b = ensureBadge(v);
-    hideAllBadges(v);
-    b.style.display = 'block';
-    clearTimeout(badgeTimer);
-    badgeTimer = setTimeout(() => {
-      if (b.dataset.hover === '1') return; // mouse sits on the badge
-      if (currentVideo === v) return;      // still hovering the video
-      b.style.display = 'none';
-    }, 1400);
-    if (!rafId) rafId = requestAnimationFrame(trackBadges);
+  let moveScheduled = false;
+  let lastMouseX = -1;
+  let lastMouseY = -1;
+
+  document.addEventListener('mousemove', (e) => {
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+    if (moveScheduled) return;
+    moveScheduled = true;
+    requestAnimationFrame(() => {
+      moveScheduled = false;
+      // 如果鼠标正悬停在按钮本身上，保持显示
+      for (const [v, b] of badges) {
+        if (b.dataset.hover === '1') {
+          currentVideo = v;
+          return;
+        }
+      }
+      const v = findTopRightCornerVideo(lastMouseX, lastMouseY);
+      currentVideo = v;
+      if (!v) {
+        hideAllBadges(null);
+        return;
+      }
+      const b = ensureBadge(v);
+      hideAllBadges(v);
+      showBadge(b);
+      if (!rafId) rafId = requestAnimationFrame(trackBadges);
+    });
+  }, { passive: true });
+
+  document.addEventListener('mouseleave', () => {
+    currentVideo = null;
+    hideAllBadges(null);
   });
 
   /* --------------------------- bottom-right panel --------------------------- */
+  // 是否为顶层主页面（iframe / 内嵌小弹窗不显示右下角常驻悬浮按钮，仅保留视频右上角悬停按钮）
+  const isTopFrame = (() => {
+    try { return window.self === window.top; } catch (e) { return false; }
+  })();
+  let fabDismissed = false;
+  let fabHovered = false;
+
   const fab = document.createElement('div');
   fab.id = NS + 'fab';
   Object.assign(fab.style, {
     position: 'fixed',
-    right: '16px',
-    bottom: '16px',
+    right: '0px',
+    bottom: '20px',
     zIndex: '2147483647',
-    display: 'flex',
+    display: 'none', // 默认隐藏，仅在顶层页面检测到有效视频时自动显现
     flexDirection: 'column',
     alignItems: 'flex-end',
     gap: '8px',
     font: '13px/1.5 system-ui, "Microsoft YaHei", sans-serif',
+    pointerEvents: 'none',
+  });
+
+  const fabPill = document.createElement('div');
+  Object.assign(fabPill.style, {
+    display: 'inline-flex',
+    alignItems: 'center',
+    pointerEvents: 'auto',
+    borderRadius: '999px 0 0 999px',
+    background: 'linear-gradient(135deg,#6d5cff,#3aa0ff)',
+    boxShadow: '0 4px 16px rgba(60,60,220,.32)',
+    transform: 'translateX(calc(100% - 28px))',
+    opacity: '0.45',
+    transition: 'transform .24s cubic-bezier(.2,.8,.2,1), opacity .24s ease, box-shadow .24s ease',
+    overflow: 'hidden',
+    userSelect: 'none',
   });
 
   const fabBtn = document.createElement('button');
-  fabBtn.textContent = '\u591a\u7a97\u64ad\u653e';
+  fabBtn.textContent = '\ud83c\udfac \u591a\u7a97\u64ad\u653e';
+  fabBtn.title = '\u5c55\u5f00/\u6536\u8d77\u591a\u7a97\u64ad\u653e\u9762\u677f';
   Object.assign(fabBtn.style, {
     cursor: 'pointer',
     border: 'none',
-    borderRadius: '999px',
-    padding: '10px 16px',
+    padding: '7px 8px 7px 11px',
     color: '#fff',
     fontWeight: '600',
-    font: 'inherit',
-    background: 'linear-gradient(135deg,#6d5cff,#3aa0ff)',
-    boxShadow: '0 6px 20px rgba(80,80,255,.35)',
+    fontSize: '12.5px',
+    fontFamily: 'inherit',
+    background: 'transparent',
+    whiteSpace: 'nowrap',
   });
-  fab.appendChild(fabBtn);
+
+  const fabCloseBtn = document.createElement('button');
+  fabCloseBtn.textContent = '\u00d7';
+  fabCloseBtn.title = '\u9690\u85cf\u6b64\u60ac\u6d6e\u6309\u94ae\uff08\u4ecd\u53ef\u901a\u8fc7\u60ac\u505c\u89c6\u9891\u53f3\u4e0a\u89d2\u300c\u72ec\u7acb\u64ad\u653e\u300d\u6216 Alt+Shift+S \u4f7f\u7528\uff09';
+  Object.assign(fabCloseBtn.style, {
+    cursor: 'pointer',
+    border: 'none',
+    borderLeft: '1px solid rgba(255,255,255,.22)',
+    padding: '7px 9px 7px 7px',
+    color: 'rgba(255,255,255,.85)',
+    fontSize: '14px',
+    lineHeight: '1',
+    fontFamily: 'inherit',
+    background: 'transparent',
+  });
+  fabCloseBtn.addEventListener('mouseenter', () => { fabCloseBtn.style.color = '#fff'; fabCloseBtn.style.background = 'rgba(0,0,0,.15)'; });
+  fabCloseBtn.addEventListener('mouseleave', () => { fabCloseBtn.style.color = 'rgba(255,255,255,.85)'; fabCloseBtn.style.background = 'transparent'; });
+
+  fabPill.append(fabBtn, fabCloseBtn);
+  fab.appendChild(fabPill);
 
   const panel = document.createElement('div');
   Object.assign(panel.style, {
     display: 'none',
+    pointerEvents: 'auto',
+    marginRight: '12px',
     width: '320px',
     maxHeight: '60vh',
     overflow: 'auto',
@@ -1943,7 +2218,58 @@
     boxShadow: '0 10px 40px rgba(0,0,0,.5)',
   });
   fab.appendChild(panel);
-  (document.documentElement || document.body).appendChild(fab);
+  if (isTopFrame) {
+    (document.documentElement || document.body).appendChild(fab);
+  }
+
+  function syncFabDockState() {
+    const isOpen = panel.style.display !== 'none';
+    if (fabHovered || isOpen) {
+      fabPill.style.transform = 'translateX(0)';
+      fabPill.style.opacity = '1';
+      fabPill.style.boxShadow = '0 6px 20px rgba(80,80,255,.45)';
+    } else {
+      fabPill.style.transform = 'translateX(calc(100% - 28px))';
+      fabPill.style.opacity = '0.45';
+      fabPill.style.boxShadow = '0 4px 16px rgba(60,60,220,.32)';
+    }
+  }
+
+  function updateFabVisibility(videoCount) {
+    if (!isTopFrame) return;
+    if (fabDismissed) {
+      fab.style.display = 'none';
+      return;
+    }
+    // 排除面积过小的弹窗窗口（如小登录窗）
+    if (window.innerWidth < 300 || window.innerHeight < 200) {
+      fab.style.display = 'none';
+      return;
+    }
+    const hasActivePop = Boolean(
+      (dock && !dock.win.closed) ||
+      nativePopped.size > 0 ||
+      companionPopped.size > 0 ||
+      dockCrossPopped.size > 0
+    );
+    const count = typeof videoCount === 'number' ? videoCount : collectVideos().length;
+    if (count > 0 || hasActivePop) {
+      fab.style.display = 'flex';
+      syncFabDockState();
+    } else {
+      panel.style.display = 'none';
+      fab.style.display = 'none';
+    }
+  }
+
+  fab.addEventListener('mouseenter', () => {
+    fabHovered = true;
+    syncFabDockState();
+  });
+  fab.addEventListener('mouseleave', () => {
+    fabHovered = false;
+    syncFabDockState();
+  });
 
   let panelRows = []; // [{ v, info, btn, recallBtn, speedBtn }]
   let lastCount = -1;
@@ -1951,7 +2277,15 @@
   fabBtn.addEventListener('click', () => {
     const show = panel.style.display === 'none';
     panel.style.display = show ? 'block' : 'none';
+    syncFabDockState();
     if (show) renderPanel();
+  });
+
+  fabCloseBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    fabDismissed = true;
+    panel.style.display = 'none';
+    fab.style.display = 'none';
   });
 
   /* Mode switch: native dock / native video PiP / frameless companion window */
@@ -2303,11 +2637,12 @@
     });
   }
 
-  // While the panel is open: rebuild only when video count changes,
-  // otherwise just refresh row states.
+  // 定时检测当前页面是否有有效视频，控制边缘悬浮球显隐，并在面板展开时自动刷新状态
+  updateFabVisibility();
   setInterval(() => {
-    if (panel.style.display === 'none') return;
     const n = collectVideos().length;
+    updateFabVisibility(n);
+    if (panel.style.display === 'none') return;
     if (n !== lastCount) renderPanel();
     else refreshStates();
   }, 1200);
@@ -2346,15 +2681,18 @@
 
           remotePc.onicecandidate = (event) => {
             if (event.candidate && fromTab != null) {
-              bgSend({
-                type: 'mp-rtc-ice',
-                toTab: fromTab,
-                connId,
-                candidate: typeof event.candidate.toJSON === 'function' ? event.candidate.toJSON() : {
-                  candidate: event.candidate.candidate,
-                  sdpMid: event.candidate.sdpMid,
-                  sdpMLineIndex: event.candidate.sdpMLineIndex,
-                },
+              const rawCand = typeof event.candidate.toJSON === 'function' ? event.candidate.toJSON() : {
+                candidate: event.candidate.candidate,
+                sdpMid: event.candidate.sdpMid,
+                sdpMLineIndex: event.candidate.sdpMLineIndex,
+              };
+              expandLoopbackCandidates(rawCand).forEach((cand) => {
+                bgSend({
+                  type: 'mp-rtc-ice',
+                  toTab: fromTab,
+                  connId,
+                  candidate: cand,
+                });
               });
             }
           };
@@ -2378,9 +2716,14 @@
       // WebRTC Source Tab: receive answer from dock owner
       if (msg && msg.type === 'mp-rtc-answer') {
         const conn = rtcConnections.get(msg.connId);
-        if (conn && conn.pc) {
-          conn.pc.setRemoteDescription(new RTCSessionDescription(msg.answer)).then(() => {
-            log('WebRTC connection established between tabs for connId:', msg.connId);
+        if (conn && conn.pc && msg.answer) {
+          const hqAnswer = {
+            type: msg.answer.type,
+            sdp: boostWebRtcVideoSdp(msg.answer.sdp),
+          };
+          conn.pc.setRemoteDescription(new RTCSessionDescription(hqAnswer)).then(() => {
+            applyHighQualityRtcSenders(conn.pc);
+            log('WebRTC HQ connection established between tabs for connId:', msg.connId);
           }).catch((err) => {
             log('setRemoteDescription on answer failed:', err);
           });
@@ -2389,22 +2732,24 @@
 
       // WebRTC: receive ICE candidate
       if (msg && msg.type === 'mp-rtc-ice') {
-        const candidate = new RTCIceCandidate(msg.candidate);
-        // Check if dock owner card
-        if (dock && dock.cards) {
-          const card = dock.cards.find((c) =>
-            (msg.fromTab != null ? c.sourceTabId === msg.fromTab : true) &&
-            (c.connId === msg.connId || (c.meta && c.meta.id === msg.connId))
-          );
-          if (card && card.remotePc) {
-            card.remotePc.addIceCandidate(candidate).catch(() => {});
+        expandLoopbackCandidates(msg.candidate).forEach((candObj) => {
+          const candidate = new RTCIceCandidate(candObj);
+          // Check if dock owner card
+          if (dock && dock.cards) {
+            const card = dock.cards.find((c) =>
+              (msg.fromTab != null ? c.sourceTabId === msg.fromTab : true) &&
+              (c.connId === msg.connId || (c.meta && c.meta.id === msg.connId))
+            );
+            if (card && card.remotePc) {
+              card.remotePc.addIceCandidate(candidate).catch(() => {});
+            }
           }
-        }
-        // Check if source tab
-        const conn = rtcConnections.get(msg.connId);
-        if (conn && conn.pc) {
-          conn.pc.addIceCandidate(candidate).catch(() => {});
-        }
+          // Check if source tab
+          const conn = rtcConnections.get(msg.connId);
+          if (conn && conn.pc) {
+            conn.pc.addIceCandidate(candidate).catch(() => {});
+          }
+        });
       }
 
       // Dock Owner: receive playback state sync from source tab
@@ -2479,11 +2824,35 @@
         const data = msg.data;
         if (!conn || !data) return;
         if (data.cmd === 'rtc-answer') {
-          conn.pc.setRemoteDescription(new RTCSessionDescription(data.answer)).catch((e) => {
-            log('companion setRemoteDescription error:', e);
-          });
+          conn.answerReceived = true;
+          if (conn.retryTimer) {
+            clearInterval(conn.retryTimer);
+            conn.retryTimer = null;
+          }
+          if (conn.pc.signalingState === 'have-local-offer' && data.answer) {
+            const hqAnswer = {
+              type: data.answer.type,
+              sdp: boostWebRtcVideoSdp(data.answer.sdp),
+            };
+            conn.pc.setRemoteDescription(new RTCSessionDescription(hqAnswer)).then(() => {
+              applyHighQualityRtcSenders(conn.pc);
+              if (conn.iceCandidates && conn.iceCandidates.length) {
+                conn.iceCandidates.forEach((cand) => {
+                  bgSend({
+                    type: 'mp-companion-signal',
+                    id: msg.id,
+                    data: { cmd: 'rtc-ice', candidate: cand }
+                  });
+                });
+              }
+            }).catch((e) => {
+              log('companion setRemoteDescription error:', e);
+            });
+          }
         } else if (data.cmd === 'rtc-ice') {
-          conn.pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
+          expandLoopbackCandidates(data.candidate).forEach((cand) => {
+            conn.pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+          });
         } else if (data.cmd === 'ctl') {
           const v = conn.video;
           if (v) {
@@ -2517,9 +2886,14 @@
           if (id === msg.id) {
             companionPopped.delete(v);
             restoreCrossSourceVideo(v);
+            unprotectSourceVideo(v);
             const conn = companionConnections.get(id);
             if (conn) {
               if (conn.syncTimer) clearInterval(conn.syncTimer);
+              if (conn.retryTimer) clearInterval(conn.retryTimer);
+              if (conn.stream && conn.stream.getTracks) {
+                conn.stream.getTracks().forEach((t) => { try { t.stop(); } catch (e) {} });
+              }
               try { conn.pc.close(); } catch (e) {}
               companionConnections.delete(id);
             }
