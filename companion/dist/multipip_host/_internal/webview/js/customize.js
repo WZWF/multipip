@@ -120,4 +120,67 @@
     }
 
     disableTouchEvents();
+
+    // -------------------------------- 沉浸式纯黑自动隐藏工具条与控制栏 --------------------------------
+    (function setupImmersiveControls() {
+        function initAutoFade() {
+            var s = document.createElement('style');
+            s.id = '__mp_immersive_style';
+            s.textContent = [
+                '#__mp_drag_titlebar, #__mp_host_ui, #__mp_controls {',
+                '  opacity: 0 !important;',
+                '  pointer-events: none !important;',
+                '  transition: opacity .25s ease !important;',
+                '}',
+                'body.mp-active #__mp_drag_titlebar {',
+                '  opacity: 0.18 !important;',
+                '  pointer-events: auto !important;',
+                '}',
+                'body.mp-active #__mp_drag_titlebar:hover {',
+                '  opacity: 1 !important;',
+                '}',
+                'body.mp-active #__mp_host_ui {',
+                '  opacity: 0.88 !important;',
+                '  pointer-events: auto !important;',
+                '}',
+                'body.mp-active #__mp_host_ui:hover {',
+                '  opacity: 1 !important;',
+                '}',
+                'body.mp-active #__mp_controls {',
+                '  opacity: 0.92 !important;',
+                '  pointer-events: auto !important;',
+                '}',
+                'body.mp-active #__mp_controls:hover {',
+                '  opacity: 1 !important;',
+                '}'
+            ].join('\n');
+            (document.head || document.documentElement).appendChild(s);
+
+            var idleTimer = 0;
+            function onUserActivity() {
+                document.body.classList.add('mp-active');
+                clearTimeout(idleTimer);
+                idleTimer = setTimeout(function() {
+                    document.body.classList.remove('mp-active');
+                }, 2200);
+            }
+
+            window.addEventListener('mousemove', onUserActivity);
+            window.addEventListener('pointermove', onUserActivity);
+            window.addEventListener('mousedown', onUserActivity);
+            window.addEventListener('keydown', onUserActivity);
+
+            // 窗口打开初期短暂展示 1.8 秒后淡出隐形，告知用户功能控件位置
+            document.body.classList.add('mp-active');
+            idleTimer = setTimeout(function() {
+                document.body.classList.remove('mp-active');
+            }, 1800);
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initAutoFade);
+        } else {
+            initAutoFade();
+        }
+    })();
   })();

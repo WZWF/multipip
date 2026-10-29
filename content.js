@@ -830,10 +830,8 @@
       position: 'absolute', top: '8px', right: '8px', display: 'flex', gap: '5px',
       padding: '4px 6px', borderRadius: '10px', background: 'rgba(0,0,0,.75)',
       boxShadow: '0 4px 16px rgba(0,0,0,0.6)', border: '1px solid rgba(255,255,255,0.2)',
-      opacity: '0.85', transition: 'opacity .2s', pointerEvents: 'auto', zIndex: '999999',
+      opacity: '0', transition: 'opacity .25s ease', pointerEvents: 'none', zIndex: '999999',
     });
-    bar.addEventListener('mouseenter', () => { bar.style.opacity = '1'; });
-    bar.addEventListener('mouseleave', () => { bar.style.opacity = '0.85'; });
     const mk = (label, title, fn) => {
       const b = doc.createElement('button');
       b.textContent = label;
@@ -909,6 +907,38 @@
     bar.appendChild(mk('\u5927', '\u7a97\u53e3\u5927\u5c3a\u5bf8(1180p)', () => resizeDock(d, 1180, 664)));
     bar.appendChild(mk('\uff0b\u653e\u5927', '\u7a97\u53e3\u6309\u6b65\u957f\u653e\u5927', () => stepResize(d, 120)));
     bar.appendChild(mk('\uff0d\u7f29\u5c0f', '\u7a97\u53e3\u6309\u6b65\u957f\u7f29\u5c0f', () => stepResize(d, -120)));
+    // 默认隐形透明 + 鼠标移入/晃动平滑唤醒（静止 2 秒自动隐形，实现 100% 纯黑沉浸式观影）
+    let layoutIdleTimer = 0;
+    const showLayoutBar = () => {
+      bar.style.opacity = '1';
+      bar.style.pointerEvents = 'auto';
+      clearTimeout(layoutIdleTimer);
+      layoutIdleTimer = setTimeout(hideLayoutBar, 2200);
+    };
+    const hideLayoutBar = () => {
+      // 若当前正打开分屏下拉菜单，暂不自动隐形
+      if (snapMenu.style.display === 'grid') return;
+      bar.style.opacity = '0';
+      bar.style.pointerEvents = 'none';
+    };
+
+    doc.addEventListener('mousemove', showLayoutBar);
+    doc.addEventListener('pointermove', showLayoutBar);
+    doc.addEventListener('mouseleave', hideLayoutBar);
+    bar.addEventListener('mouseenter', () => {
+      clearTimeout(layoutIdleTimer);
+      bar.style.opacity = '1';
+      bar.style.pointerEvents = 'auto';
+    });
+    bar.addEventListener('mouseleave', () => {
+      layoutIdleTimer = setTimeout(hideLayoutBar, 1200);
+    });
+
+    // 初始化时短暂展示 1.8 秒后淡出隐形，告知用户功能位置
+    bar.style.opacity = '1';
+    bar.style.pointerEvents = 'auto';
+    layoutIdleTimer = setTimeout(hideLayoutBar, 1800);
+
     doc.body.appendChild(bar);
   }
 
@@ -1111,28 +1141,52 @@
     const strip = doc.createElement('div');
     Object.assign(strip.style, {
       position: 'absolute', left: '0', right: '32px', top: '0', height: '30px',
-      cursor: 'grab', opacity: '0.85', transition: 'opacity .2s', zIndex: '99',
+      cursor: 'grab', opacity: '0', transition: 'opacity .25s ease', zIndex: '99',
       background: 'linear-gradient(to bottom, rgba(0,0,0,.85), rgba(0,0,0,.35) 75%, transparent)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       color: 'rgba(255,255,255,.95)', font: '12px/1 system-ui, Microsoft YaHei, sans-serif',
       userSelect: 'none',
       letterSpacing: '0.5px',
-      pointerEvents: 'auto',
+      pointerEvents: 'none',
     });
     strip.textContent = '\u283f \u62d6\u52a8\u79fb\u52a8';
     const grip = doc.createElement('div');
     Object.assign(grip.style, {
       position: 'absolute', right: '0', bottom: '0', width: '32px', height: '32px',
-      cursor: 'nwse-resize', opacity: '0.85', transition: 'opacity .2s', zIndex: '100',
+      cursor: 'nwse-resize', opacity: '0', transition: 'opacity .25s ease', zIndex: '100',
       background: 'linear-gradient(135deg, transparent 35%, rgba(255,255,255,.7) 40%, rgba(255,255,255,.7) 60%, transparent 65%)',
-      pointerEvents: 'auto',
+      pointerEvents: 'none',
     });
     grip.title = '\u62d6\u52a8\u7f29\u653e\u6b64\u89c6\u9891';
-    card.slot.addEventListener('mouseenter', () => { strip.style.opacity = '1'; grip.style.opacity = '1'; });
-    card.slot.addEventListener('mouseleave', () => {
+
+    let cardIdleTimer = 0;
+    const showCardOverlays = () => {
+      strip.style.opacity = '1';
+      strip.style.pointerEvents = 'auto';
+      grip.style.opacity = '1';
+      grip.style.pointerEvents = 'auto';
+      if (card.bar) {
+        card.bar.style.opacity = '1';
+        card.bar.style.pointerEvents = 'auto';
+      }
+      clearTimeout(cardIdleTimer);
+      cardIdleTimer = setTimeout(hideCardOverlays, 2200);
+    };
+    const hideCardOverlays = () => {
       if (d.draggingCard === card) return;
-      strip.style.opacity = '0.85'; grip.style.opacity = '0.85';
-    });
+      strip.style.opacity = '0';
+      strip.style.pointerEvents = 'none';
+      grip.style.opacity = '0';
+      grip.style.pointerEvents = 'none';
+      if (card.bar) {
+        card.bar.style.opacity = '0';
+        card.bar.style.pointerEvents = 'none';
+      }
+    };
+
+    card.slot.addEventListener('mouseenter', showCardOverlays);
+    card.slot.addEventListener('mousemove', showCardOverlays);
+    card.slot.addEventListener('mouseleave', hideCardOverlays);
 
     // 点击卡片自动置顶
     card.slot.addEventListener('pointerdown', () => {
@@ -1398,10 +1452,10 @@
       font: '12px/1.2 system-ui, Microsoft YaHei, sans-serif',
       boxShadow: '0 4px 16px rgba(0,0,0,0.7)',
       border: '1px solid rgba(255,255,255,0.18)',
-      opacity: '0.88', transition: 'opacity .2s', pointerEvents: 'auto', zIndex: '99',
+      opacity: '0', transition: 'opacity .25s ease', pointerEvents: 'none', zIndex: '99',
     });
-    bar.addEventListener('mouseenter', () => { bar.style.opacity = '1'; });
-    bar.addEventListener('mouseleave', () => { bar.style.opacity = '0.88'; });
+    bar.addEventListener('mouseenter', () => { bar.style.opacity = '1'; bar.style.pointerEvents = 'auto'; });
+    bar.addEventListener('mouseleave', () => { bar.style.opacity = '0'; bar.style.pointerEvents = 'none'; });
     const mk = (text, title, fn, extra) => {
       const b = doc.createElement('button');
       b.textContent = text;
