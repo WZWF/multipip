@@ -859,6 +859,51 @@
     const fsBtn = mk('\u5168\u5c4f', '\u575e\u7a97\u53e3\u5168\u5c4f / \u9000\u51fa\u5168\u5c4f', () => toggleWindowFullscreen(d));
     d.fsBtn = fsBtn;
     bar.appendChild(fsBtn);
+
+    // 屏幕分屏贴靠（Win10/11 Aero Snap 快捷分屏面板）
+    const snapWrap = doc.createElement('div');
+    Object.assign(snapWrap.style, { position: 'relative', display: 'inline-flex', alignItems: 'center' });
+    const snapBtn = mk('\u229e \u5206\u5c4f', '\u5feb\u901f\u8d34\u9760\u5c4f\u5e55\uff1a\u534a\u5c4f / \u56db\u5206\u4e4b\u4e00\u5c4f');
+    const snapMenu = doc.createElement('div');
+    Object.assign(snapMenu.style, {
+      position: 'absolute', top: 'calc(100% + 6px)', right: '0', display: 'none',
+      gridTemplateColumns: 'repeat(2, 1fr)', gap: '4px', padding: '6px',
+      borderRadius: '8px', background: 'rgba(16,18,26,0.95)', border: '1px solid rgba(255,255,255,0.22)',
+      boxShadow: '0 8px 24px rgba(0,0,0,0.65)', backdropFilter: 'blur(8px)', zIndex: '9999999', minWidth: '150px'
+    });
+    [
+      ['\u25e7 \u5de6\u534a\u5c4f', 'left'],   ['\u25e8 \u53f3\u534a\u5c4f', 'right'],
+      ['\u2b12 \u4e0a\u534a\u5c4f', 'top'],    ['\u2b13 \u4e0b\u534a\u5c4f', 'bottom'],
+      ['\u259b \u5de6\u4e0a 1/4', 'tl'],   ['\u259c \u53f3\u4e0a 1/4', 'tr'],
+      ['\u2599 \u5de6\u4e0b 1/4', 'bl'],   ['\u259f \u53f3\u4e0b 1/4', 'br'],
+      ['\u21ba \u6062\u590d\u539f\u72b6', 'restore'], ['\u26f6 \u94fa\u6ee1\u5c4f', 'max'],
+    ].forEach(([label, zone]) => {
+      const item = doc.createElement('button');
+      item.textContent = label;
+      Object.assign(item.style, {
+        cursor: 'pointer', border: '1px solid rgba(255,255,255,.2)',
+        background: 'rgba(255,255,255,.1)', color: '#fff', borderRadius: '5px',
+        padding: '4px 6px', fontSize: '11px', textAlign: 'left', whiteSpace: 'nowrap'
+      });
+      item.onmouseover = () => { item.style.background = 'rgba(255,255,255,.25)'; };
+      item.onmouseout = () => { item.style.background = 'rgba(255,255,255,.1)'; };
+      item.onclick = (ev) => {
+        ev.stopPropagation();
+        snapMenu.style.display = 'none';
+        snapDockWindow(d, zone);
+      };
+      snapMenu.appendChild(item);
+    });
+    snapBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      snapMenu.style.display = snapMenu.style.display === 'grid' ? 'none' : 'grid';
+    };
+    doc.addEventListener('mousedown', (ev) => {
+      if (!snapWrap.contains(ev.target)) snapMenu.style.display = 'none';
+    });
+    snapWrap.append(snapBtn, snapMenu);
+    bar.appendChild(snapWrap);
+
     bar.appendChild(mk('\u5c0f', '\u7a97\u53e3\u7f29\u5230\u5c0f\u5c3a\u5bf8(480p)', () => resizeDock(d, 480, 270)));
     bar.appendChild(mk('\u4e2d', '\u7a97\u53e3\u4e2d\u5c3a\u5bf8(820p)', () => resizeDock(d, 820, 462)));
     bar.appendChild(mk('\u5927', '\u7a97\u53e3\u5927\u5c3a\u5bf8(1180p)', () => resizeDock(d, 1180, 664)));
@@ -956,6 +1001,65 @@
     }
   }
 
+
+  function snapDockWindow(d, zone) {
+    const win = d.win;
+    if (!win) return;
+    if (zone === 'restore') {
+      if (d.snapSavedBounds) {
+        const b = d.snapSavedBounds;
+        try {
+          if (win.moveTo && b.left != null && b.top != null) win.moveTo(b.left, b.top);
+          if (win.resizeTo && b.width && b.height) win.resizeTo(b.width, b.height);
+        } catch (e) {}
+        d.isMaximized = false;
+        if (d.fsBtn) { d.fsBtn.textContent = '\u5168\u5c4f'; d.fsBtn.title = '\u575e\u7a97\u53e3\u5168\u5c4f / \u9000\u51fa\u5168\u5c4f'; }
+      }
+      return;
+    }
+
+    if (!d.snapSavedBounds) {
+      d.snapSavedBounds = {
+        left: (typeof win.screenX === 'number' ? win.screenX : win.screenLeft) ?? 100,
+        top: (typeof win.screenY === 'number' ? win.screenY : win.screenTop) ?? 100,
+        width: win.outerWidth || win.innerWidth || 820,
+        height: win.outerHeight || win.innerHeight || 462,
+      };
+    }
+
+    const screenObj = (win && win.screen) || (typeof screen !== 'undefined' ? screen : null);
+    const sw = (screenObj && (screenObj.availWidth || screenObj.width)) || 1920;
+    const sh = (screenObj && (screenObj.availHeight || screenObj.height)) || 1080;
+    const sl = (screenObj && screenObj.availLeft !== undefined ? screenObj.availLeft : 0) || 0;
+    const st = (screenObj && screenObj.availTop !== undefined ? screenObj.availTop : 0) || 0;
+    const hw = Math.floor(sw / 2);
+    const hh = Math.floor(sh / 2);
+
+    let target = null;
+    if (zone === 'left')        target = { x: sl,      y: st,      w: hw,     h: sh };
+    else if (zone === 'right')  target = { x: sl + hw, y: st,      w: sw - hw, h: sh };
+    else if (zone === 'top')    target = { x: sl,      y: st,      w: sw,     h: hh };
+    else if (zone === 'bottom') target = { x: sl,      y: st + hh, w: sw,     h: sh - hh };
+    else if (zone === 'tl')     target = { x: sl,      y: st,      w: hw,     h: hh };
+    else if (zone === 'tr')     target = { x: sl + hw, y: st,      w: sw - hw, h: hh };
+    else if (zone === 'bl')     target = { x: sl,      y: st + hh, w: hw,     h: sh - hh };
+    else if (zone === 'br')     target = { x: sl + hw, y: st + hh, w: sw - hw, h: sh - hh };
+    else if (zone === 'max')    target = { x: sl,      y: st,      w: sw,     h: sh };
+
+    if (!target) return;
+    try {
+      if (win.moveTo) win.moveTo(target.x, target.y);
+      if (win.resizeTo) win.resizeTo(target.w, target.h);
+      setTimeout(() => {
+        try {
+          if (win.moveTo) win.moveTo(target.x, target.y);
+          if (win.resizeTo) win.resizeTo(target.w, target.h);
+        } catch (e) {}
+      }, 60);
+    } catch (e) {
+      log('snapDockWindow failed', e);
+    }
+  }
 
   function maximizeDockWindow(d) {
     const win = d.win;
@@ -2429,6 +2533,31 @@
           windows.push({ id: ids[i], x: mainW, y: (i - 1) * sideH, width: sideW, height: sideH });
         }
       }
+    } else if (mode === 'snap_half_left') {
+      // 单窗或多窗贴靠左半屏
+      const w = Math.floor(screenW * 0.5);
+      const h = Math.floor(screenH / count);
+      ids.forEach((id, i) => windows.push({ id, x: 0, y: i * h, width: w, height: h }));
+    } else if (mode === 'snap_half_right') {
+      // 单窗或多窗贴靠右半屏
+      const w = Math.floor(screenW * 0.5);
+      const h = Math.floor(screenH / count);
+      ids.forEach((id, i) => windows.push({ id, x: w, y: i * h, width: screenW - w, height: h }));
+    } else if (mode === 'snap_quarter_tl') {
+      // 贴靠左上角 1/4
+      const w = Math.floor(screenW * 0.5);
+      const h = Math.floor(screenH * 0.5);
+      windows.push({ id: ids[0], x: 0, y: 0, width: w, height: h });
+    } else if (mode === 'snap_quarter_tr') {
+      // 贴靠右上角 1/4
+      const w = Math.floor(screenW * 0.5);
+      const h = Math.floor(screenH * 0.5);
+      windows.push({ id: ids[0], x: w, y: 0, width: screenW - w, height: h });
+    } else if (mode === 'snap_quarter_br') {
+      // 贴靠右下角 1/4
+      const w = Math.floor(screenW * 0.5);
+      const h = Math.floor(screenH * 0.5);
+      windows.push({ id: ids[0], x: w, y: h, width: screenW - w, height: screenH - h });
     }
 
     bgSend({ type: 'mp-companion-layout', windows }).then((r) => {
@@ -2440,6 +2569,10 @@
   [
     ['均分平铺', 'grid', '将当前所有无边框窗按网格平分整个屏幕（如 2x2 四开、3x2 六开）'],
     ['左右对分', 'split_v', '左右等宽平分屏幕'],
+    ['左半', 'snap_half_left', '将当前窗口贴靠至屏幕左半边 (1/2)'],
+    ['右半', 'snap_half_right', '将当前窗口贴靠至屏幕右半边 (1/2)'],
+    ['右上1/4', 'snap_quarter_tr', '将当前窗口贴靠至右上角 (1/4)'],
+    ['右下1/4', 'snap_quarter_br', '将当前窗口贴靠至右下角 (1/4)'],
     ['上分下独', 'top2_bot1', '上方多视频平分，下方视频独占大屏'],
     ['左大右辅', 'left1_right2', '左侧主视频大屏展示，右侧副视频排列'],
   ].forEach(([txt, mode, tip]) => {
