@@ -822,94 +822,146 @@
     });
   }
 
-  /** Tiny layout switcher, top-right, always visible so controls are never missed. */
+  /** Clean & unobtrusive layout switcher: collapsed into a single gear icon button at top-right.
+   *  Clicking it opens a neatly organized popup menu for layouts, snapping, window sizes, and fullscreen. */
   function makeLayoutBar(d) {
     const doc = d.doc;
-    const bar = doc.createElement('div');
-    Object.assign(bar.style, {
-      position: 'absolute', top: '8px', right: '8px', display: 'flex', gap: '5px',
-      padding: '4px 6px', borderRadius: '10px', background: 'rgba(0,0,0,.75)',
-      boxShadow: '0 4px 16px rgba(0,0,0,0.6)', border: '1px solid rgba(255,255,255,0.2)',
-      opacity: '0.85', transition: 'opacity .2s', pointerEvents: 'auto', zIndex: '999999',
+    const wrap = doc.createElement('div');
+    Object.assign(wrap.style, {
+      position: 'absolute', top: '8px', right: '8px', zIndex: '999999',
+      display: 'inline-flex', alignItems: 'center', pointerEvents: 'auto',
     });
-    bar.addEventListener('mouseenter', () => { bar.style.opacity = '1'; });
-    bar.addEventListener('mouseleave', () => { bar.style.opacity = '0.85'; });
-    const mk = (label, title, fn) => {
+
+    const triggerBtn = doc.createElement('button');
+    triggerBtn.textContent = '⚙';
+    triggerBtn.title = '窗口布局与分屏设置';
+    Object.assign(triggerBtn.style, {
+      width: '28px', height: '28px', borderRadius: '50%', cursor: 'pointer',
+      border: '1px solid rgba(255,255,255,0.25)', background: 'rgba(0,0,0,0.65)',
+      color: 'rgba(255,255,255,0.85)', fontSize: '15px', lineHeight: '26px', textAlign: 'center',
+      boxShadow: '0 2px 10px rgba(0,0,0,0.45)', backdropFilter: 'blur(6px)',
+      opacity: '0.45', transition: 'all .2s ease', padding: '0',
+    });
+    triggerBtn.addEventListener('mouseenter', () => {
+      triggerBtn.style.opacity = '1';
+      triggerBtn.style.background = 'rgba(20,20,30,0.88)';
+      triggerBtn.style.borderColor = 'rgba(255,255,255,0.5)';
+    });
+    triggerBtn.addEventListener('mouseleave', () => {
+      if (popMenu.style.display !== 'block') {
+        triggerBtn.style.opacity = '0.45';
+        triggerBtn.style.background = 'rgba(0,0,0,0.65)';
+        triggerBtn.style.borderColor = 'rgba(255,255,255,0.25)';
+      }
+    });
+
+    const popMenu = doc.createElement('div');
+    Object.assign(popMenu.style, {
+      position: 'absolute', top: '34px', right: '0', display: 'none',
+      width: '220px', padding: '10px', borderRadius: '12px',
+      background: 'rgba(16,18,26,0.94)', border: '1px solid rgba(255,255,255,0.22)',
+      boxShadow: '0 10px 30px rgba(0,0,0,0.7)', backdropFilter: 'blur(10px)',
+      color: '#fff', font: '12px system-ui, "Microsoft YaHei", sans-serif',
+      userSelect: 'none',
+    });
+
+    const mkSectionTitle = (txt) => {
+      const t = doc.createElement('div');
+      t.textContent = txt;
+      Object.assign(t.style, {
+        fontSize: '11px', color: 'rgba(255,255,255,0.5)', margin: '6px 0 4px',
+        fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.5px'
+      });
+      return t;
+    };
+
+    const mkBtn = (label, title, fn, active) => {
       const b = doc.createElement('button');
       b.textContent = label;
       b.title = title || '';
       Object.assign(b.style, {
-        cursor: 'pointer', border: '1px solid rgba(255,255,255,.25)',
-        background: 'rgba(255,255,255,.12)', color: '#fff', borderRadius: '6px',
-        padding: '3px 8px', font: '12px/1.2 system-ui, Microsoft YaHei, sans-serif',
+        cursor: 'pointer', border: '1px solid rgba(255,255,255,0.18)',
+        background: active ? 'rgba(58,160,255,0.35)' : 'rgba(255,255,255,0.08)',
+        color: '#fff', borderRadius: '6px', padding: '4px 6px',
+        fontSize: '11px', textAlign: 'center', transition: 'background .15s',
       });
-      b.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+      b.onmouseover = () => { if (!active) b.style.background = 'rgba(255,255,255,0.2)'; };
+      b.onmouseout = () => { if (!active) b.style.background = 'rgba(255,255,255,0.08)'; };
+      b.onclick = (e) => { e.stopPropagation(); fn(); };
       return b;
     };
-    [['stack', '\u5806\u53e0', '\u6309\u5bbd\u9ad8\u6bd4\u7eb5\u5411\u5806\u53e0'], ['grid', '\u5bab\u683c', '\u7b49\u5206\u5bab\u683c'], ['bigLeft', '\u5927\u5de6', '\u4e3b\u753b\u9762\u5728\u5de6'], ['bigRight', '\u5927\u53f3', '\u4e3b\u753b\u9762\u5728\u53f3'], ['free', '\u81ea\u7531', '\u81ea\u7531\u62d6\u52a8 / \u7f29\u653e\u6bcf\u4e2a\u89c6\u9891']].forEach(([key, label, title]) => {
-      bar.appendChild(mk(label, title, () => {
-        d.free = key === 'free';
-        if (key === 'free') {
-          syncDockGeometry(d);
-        } else {
-          applyLayout(d);
-        }
+
+    // 1. 排版布局 (stack / grid / bigLeft / bigRight / free)
+    popMenu.appendChild(mkSectionTitle('多画面排版'));
+    const layoutGrid = doc.createElement('div');
+    Object.assign(layoutGrid.style, { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '4px' });
+    [
+      ['stack', '堆叠', '纵向堆叠'],
+      ['grid', '等分', '均分宫格'],
+      ['bigLeft', '大左', '主画面居左'],
+      ['bigRight', '大右', '主画面居右'],
+      ['free', '自由', '自由拖拽缩放'],
+    ].forEach(([k, name, tip]) => {
+      layoutGrid.appendChild(mkBtn(name, tip, () => {
+        d.free = k === 'free';
+        if (k === 'free') syncDockGeometry(d);
+        else applyLayout(d);
       }));
     });
-    const fsBtn = mk('\u5168\u5c4f', '\u575e\u7a97\u53e3\u5168\u5c4f / \u9000\u51fa\u5168\u5c4f', () => toggleWindowFullscreen(d));
+    const fsBtn = mkBtn('全屏', '窗口全屏/退出', () => toggleWindowFullscreen(d));
     d.fsBtn = fsBtn;
-    bar.appendChild(fsBtn);
+    layoutGrid.appendChild(fsBtn);
+    popMenu.appendChild(layoutGrid);
 
-    // 屏幕分屏贴靠（Win10/11 Aero Snap 快捷分屏面板）
-    const snapWrap = doc.createElement('div');
-    Object.assign(snapWrap.style, { position: 'relative', display: 'inline-flex', alignItems: 'center' });
-    const snapBtn = mk('\u229e \u5206\u5c4f', '\u5feb\u901f\u8d34\u9760\u5c4f\u5e55\uff1a\u534a\u5c4f / \u56db\u5206\u4e4b\u4e00\u5c4f');
-    const snapMenu = doc.createElement('div');
-    Object.assign(snapMenu.style, {
-      position: 'absolute', top: 'calc(100% + 6px)', right: '0', display: 'none',
-      gridTemplateColumns: 'repeat(2, 1fr)', gap: '4px', padding: '6px',
-      borderRadius: '8px', background: 'rgba(16,18,26,0.95)', border: '1px solid rgba(255,255,255,0.22)',
-      boxShadow: '0 8px 24px rgba(0,0,0,0.65)', backdropFilter: 'blur(8px)', zIndex: '9999999', minWidth: '150px'
-    });
+    // 2. 屏幕贴靠分屏 (Win10/11 Aero Snap)
+    popMenu.appendChild(mkSectionTitle('屏幕贴靠 (1/2 · 1/4)'));
+    const snapGrid = doc.createElement('div');
+    Object.assign(snapGrid.style, { display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '4px' });
     [
-      ['\u25e7 \u5de6\u534a\u5c4f', 'left'],   ['\u25e8 \u53f3\u534a\u5c4f', 'right'],
-      ['\u2b12 \u4e0a\u534a\u5c4f', 'top'],    ['\u2b13 \u4e0b\u534a\u5c4f', 'bottom'],
-      ['\u259b \u5de6\u4e0a 1/4', 'tl'],   ['\u259c \u53f3\u4e0a 1/4', 'tr'],
-      ['\u2599 \u5de6\u4e0b 1/4', 'bl'],   ['\u259f \u53f3\u4e0b 1/4', 'br'],
-      ['\u21ba \u6062\u590d\u539f\u72b6', 'restore'], ['\u26f6 \u94fa\u6ee1\u5c4f', 'max'],
+      ['◧ 左半屏', 'left'],   ['◨ 右半屏', 'right'],
+      ['⬒ 上半屏', 'top'],    ['⬓ 下半屏', 'bottom'],
+      ['▛ 左上 1/4', 'tl'],   ['▜ 右上 1/4', 'tr'],
+      ['▙ 左下 1/4', 'bl'],   ['▟ 右下 1/4', 'br'],
+      ['↺ 还原原状', 'restore'], ['⛶ 铺满全屏', 'max'],
     ].forEach(([label, zone]) => {
-      const item = doc.createElement('button');
-      item.textContent = label;
-      Object.assign(item.style, {
-        cursor: 'pointer', border: '1px solid rgba(255,255,255,.2)',
-        background: 'rgba(255,255,255,.1)', color: '#fff', borderRadius: '5px',
-        padding: '4px 6px', fontSize: '11px', textAlign: 'left', whiteSpace: 'nowrap'
-      });
-      item.onmouseover = () => { item.style.background = 'rgba(255,255,255,.25)'; };
-      item.onmouseout = () => { item.style.background = 'rgba(255,255,255,.1)'; };
-      item.onclick = (ev) => {
-        ev.stopPropagation();
-        snapMenu.style.display = 'none';
+      snapGrid.appendChild(mkBtn(label, '', () => {
+        popMenu.style.display = 'none';
         snapDockWindow(d, zone);
-      };
-      snapMenu.appendChild(item);
+      }));
     });
-    snapBtn.onclick = (ev) => {
-      ev.stopPropagation();
-      snapMenu.style.display = snapMenu.style.display === 'grid' ? 'none' : 'grid';
-    };
-    doc.addEventListener('mousedown', (ev) => {
-      if (!snapWrap.contains(ev.target)) snapMenu.style.display = 'none';
-    });
-    snapWrap.append(snapBtn, snapMenu);
-    bar.appendChild(snapWrap);
+    popMenu.appendChild(snapGrid);
 
-    bar.appendChild(mk('\u5c0f', '\u7a97\u53e3\u7f29\u5230\u5c0f\u5c3a\u5bf8(480p)', () => resizeDock(d, 480, 270)));
-    bar.appendChild(mk('\u4e2d', '\u7a97\u53e3\u4e2d\u5c3a\u5bf8(820p)', () => resizeDock(d, 820, 462)));
-    bar.appendChild(mk('\u5927', '\u7a97\u53e3\u5927\u5c3a\u5bf8(1180p)', () => resizeDock(d, 1180, 664)));
-    bar.appendChild(mk('\uff0b\u653e\u5927', '\u7a97\u53e3\u6309\u6b65\u957f\u653e\u5927', () => stepResize(d, 120)));
-    bar.appendChild(mk('\uff0d\u7f29\u5c0f', '\u7a97\u53e3\u6309\u6b65\u957f\u7f29\u5c0f', () => stepResize(d, -120)));
-    doc.body.appendChild(bar);
+    // 3. 尺寸缩放
+    popMenu.appendChild(mkSectionTitle('窗口预设尺寸'));
+    const sizeRow = doc.createElement('div');
+    Object.assign(sizeRow.style, { display: 'flex', gap: '4px' });
+    sizeRow.appendChild(mkBtn('小(480p)', '', () => resizeDock(d, 480, 270)));
+    sizeRow.appendChild(mkBtn('中(820p)', '', () => resizeDock(d, 820, 462)));
+    sizeRow.appendChild(mkBtn('大(1180p)', '', () => resizeDock(d, 1180, 664)));
+    sizeRow.appendChild(mkBtn('＋', '放大', () => stepResize(d, 120)));
+    sizeRow.appendChild(mkBtn('－', '缩小', () => stepResize(d, -120)));
+    popMenu.appendChild(sizeRow);
+
+    triggerBtn.onclick = (e) => {
+      e.stopPropagation();
+      const show = popMenu.style.display === 'none';
+      popMenu.style.display = show ? 'block' : 'none';
+      triggerBtn.style.opacity = show ? '1' : '0.45';
+      triggerBtn.style.background = show ? 'rgba(20,20,30,0.88)' : 'rgba(0,0,0,0.65)';
+    };
+
+    doc.addEventListener('mousedown', (e) => {
+      if (!wrap.contains(e.target)) {
+        popMenu.style.display = 'none';
+        triggerBtn.style.opacity = '0.45';
+        triggerBtn.style.background = 'rgba(0,0,0,0.65)';
+        triggerBtn.style.borderColor = 'rgba(255,255,255,0.25)';
+      }
+    });
+
+    wrap.appendChild(triggerBtn);
+    wrap.appendChild(popMenu);
+    doc.body.appendChild(wrap);
   }
 
   function stepResize(d, delta) {
