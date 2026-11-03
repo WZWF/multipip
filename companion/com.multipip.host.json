@@ -1,7 +1,7 @@
 {
   "name": "com.multipip.host",
   "description": "Multi-PiP frameless always-on-top video window host",
-  "path": "dist\\multipip_host\\multipip_host.exe",
+  "path": "D:\\code\\mix\\multipip\\companion\\dist\\multipip_host\\multipip_host.exe",
   "type": "stdio",
   "allowed_origins": [
     "chrome-extension://eeipfkplhoehahlfkehbahcnpkebhkob/"
