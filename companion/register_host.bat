@@ -1,33 +1,44 @@
 @echo off
 setlocal enabledelayedexpansion
 
-chcp 65001 >nul 2>&1
+:: 1. �Զ���ȫϵͳ·������ֹ����ϵͳ�򻷾�������ʧ�����Ҳ��� reg / chcp
+set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;!PATH!"
+
+:: 2. ׼ȷ��λϵͳ�������
+set "REG_EXE=%SystemRoot%\System32\reg.exe"
+if not exist "!REG_EXE!" set "REG_EXE=reg.exe"
+
+set "CHCP_EXE=%SystemRoot%\System32\chcp.com"
+if exist "!CHCP_EXE!" (!CHCP_EXE! 936 >nul 2>&1)
 
 echo ========================================================
-echo       Multi-PiP 无边框伴侣程序自动注册工具 (Win10/11)
+echo       Multi-PiP �ޱ߿���³����Զ�ע�Ṥ�� (Win10/11)
 echo ========================================================
 echo.
 
+:: 3. ��λ��ǰĿ¼�����ĳ���
 set "CURRENT_DIR=%~dp0"
 set "EXE_PATH=%CURRENT_DIR%dist\multipip_host\multipip_host.exe"
 set "JSON_PATH=%CURRENT_DIR%com.multipip.host.json"
 
 if not exist "%EXE_PATH%" (
-    echo [错误] 找不到伴侣核心程序: %EXE_PATH%
-    echo 请确认未将脚本移出 companion 目录，且文件已完整解压。
+    echo [����] �Ҳ������º��ĳ���:
+    echo %EXE_PATH%
+    echo ��ȷ��δ���ű��Ƴ� companion Ŀ¼�����ļ���������ѹ��
     echo.
     pause
     exit /b 1
 )
 
-set "ESCAPED_EXE=!EXE_PATH:\=\\!"
+:: 4. ת��Ϊ��ƽ̨�� JSON 100% ���ݵı�׼��б�ܾ���·��
+set "SLASH_EXE=!EXE_PATH:\=/!"
 
-echo [1/3] 正在配置本地宿主清单 (com.multipip.host.json)...
+echo [1/3] �������ñ��������嵥 (com.multipip.host.json)...
 (
     echo {
     echo   "name": "com.multipip.host",
     echo   "description": "Multi-PiP frameless always-on-top video window host",
-    echo   "path": "!ESCAPED_EXE!",
+    echo   "path": "!SLASH_EXE!",
     echo   "type": "stdio",
     echo   "allowed_origins": [
     echo     "chrome-extension://eeipfkplhoehahlfkehbahcnpkebhkob/"
@@ -36,33 +47,34 @@ echo [1/3] 正在配置本地宿主清单 (com.multipip.host.json)...
 ) > "%JSON_PATH%"
 
 if not exist "%JSON_PATH%" (
-    echo [错误] 生成清单文件失败，请检查文件夹是否有写入权限！
+    echo [����] �����嵥�ļ�ʧ�ܣ������ļ����Ƿ���д��Ȩ�ޣ�
     echo.
     pause
     exit /b 1
 )
-echo [成功] 清单文件已就绪: %JSON_PATH%
+echo [�ɹ�] �嵥�ļ��Ѿ���: %JSON_PATH%
 echo.
 
-echo [2/3] 正在写入当前用户注册表 HKCU...
+:: 5. д�뵱ǰ�û�ע��� (HKCU �������ԱȨ��)
+echo [2/3] ����д�뵱ǰ�û�ע��� HKCU...
 
-reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.multipip.host" /ve /t REG_SZ /d "%JSON_PATH%" /f >nul 2>&1
-if !errorlevel! equ 0 (echo  - Google Chrome: 注册成功) else (echo  - Google Chrome: 写入异常)
+"!REG_EXE!" add "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.multipip.host" /ve /t REG_SZ /d "%JSON_PATH%" /f >nul 2>&1
+if !errorlevel! equ 0 (echo  - Google Chrome: ע��ɹ�) else (echo  - Google Chrome: д���쳣)
 
-reg add "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.multipip.host" /ve /t REG_SZ /d "%JSON_PATH%" /f >nul 2>&1
-if !errorlevel! equ 0 (echo  - Microsoft Edge: 注册成功) else (echo  - Microsoft Edge: 写入异常)
+"!REG_EXE!" add "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.multipip.host" /ve /t REG_SZ /d "%JSON_PATH%" /f >nul 2>&1
+if !errorlevel! equ 0 (echo  - Microsoft Edge: ע��ɹ�) else (echo  - Microsoft Edge: д���쳣)
 
-reg add "HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.multipip.host" /ve /t REG_SZ /d "%JSON_PATH%" /f >nul 2>&1
-if !errorlevel! equ 0 (echo  - Brave Browser: 注册成功)
+"!REG_EXE!" add "HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.multipip.host" /ve /t REG_SZ /d "%JSON_PATH%" /f >nul 2>&1
+if !errorlevel! equ 0 (echo  - Brave Browser: ע��ɹ�)
 
-reg add "HKCU\Software\Chromium\NativeMessagingHosts\com.multipip.host" /ve /t REG_SZ /d "%JSON_PATH%" /f >nul 2>&1
-if !errorlevel! equ 0 (echo  - Chromium: 注册成功)
+"!REG_EXE!" add "HKCU\Software\Chromium\NativeMessagingHosts\com.multipip.host" /ve /t REG_SZ /d "%JSON_PATH%" /f >nul 2>&1
+if !errorlevel! equ 0 (echo  - Chromium: ע��ɹ�)
 
 echo.
-echo [3/3] 正在校验注册结果...
-reg query "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.multipip.host" /ve >nul 2>&1
+echo [3/3] ����У��ע����...
+"!REG_EXE!" query "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.multipip.host" /ve >nul 2>&1
 set "CHROME_OK=!errorlevel!"
-reg query "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.multipip.host" /ve >nul 2>&1
+"!REG_EXE!" query "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.multipip.host" /ve >nul 2>&1
 set "EDGE_OK=!errorlevel!"
 
 if "!CHROME_OK!"=="0" (
@@ -76,11 +88,11 @@ if "!CHROME_OK!"=="0" (
 echo.
 if "!REG_SUCCESS!"=="1" (
     echo ========================================================
-    echo  [安装成功] Multi-PiP 无边框伴侣程序已顺利注册完成！
+    echo  [��װ�ɹ�] Multi-PiP �ޱ߿���³�����˳��ע����ɣ�
     echo ========================================================
-    echo 提示: 回到浏览器打开 chrome://extensions/ 刷新一下扩展即可生效。
+    echo ��ʾ: �ص�������� chrome://extensions/ ˢ��һ����չ������Ч��
 ) else (
-    echo [警告] 注册表未能成功校验，可能受到安全防护软件拦截，请允许写入后重试。
+    echo [����] ע���δ�ܳɹ�У�飬�����ܵ���ȫ�����������أ�������д������ԡ�
 )
 echo.
 pause
