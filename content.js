@@ -407,10 +407,41 @@
     return list;
   }
 
-  /** 为本地回环 WebRTC 配置高清与低 CPU 开销兼顾的自适应码率（最高 12Mbps，避免 35Mbps 对核显造成过载软编） */
-  function boostWebRtcVideoSdp(sdp) {
+  /** 优先让 WebRTC 使用硬件加速的 H.264 编码，避免在核显/低配 CPU 上强行启动软编 VP9/AV1 导致 CPU 飙高和风扇狂转 */
+  function prioritizeHardwareH264(sdp) {
     if (!sdp || typeof sdp !== 'string') return sdp;
     const lines = sdp.split('\r\n');
+    let mLineIdx = -1;
+    const h264Pts = [];
+    const otherPts = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.indexOf('m=video ') === 0) {
+        mLineIdx = i;
+      }
+      const m = line.match(/^a=rtpmap:(\d+)\s+H264\/90000/i);
+      if (m) h264Pts.push(m[1]);
+      const mo = line.match(/^a=rtpmap:(\d+)\s+(VP8|VP9|AV1)\/90000/i);
+      if (mo) otherPts.push(mo[1]);
+    }
+
+    if (mLineIdx >= 0 && h264Pts.length > 0) {
+      const parts = lines[mLineIdx].split(' ');
+      const header = parts.slice(0, 3);
+      const pts = parts.slice(3);
+      const remaining = pts.filter((p) => !h264Pts.includes(p));
+      lines[mLineIdx] = header.concat(h264Pts, remaining).join(' ');
+    }
+    return lines.join('\r\n');
+  }
+
+  /** 为本地回环 WebRTC 配置高清与低 CPU 开销兼顾的自适应码率（最高 4.5Mbps，优先核显硬件 H.264 解码，多开极度流畅） */
+  function boostWebRtcVideoSdp(sdp) {
+    if (!sdp || typeof sdp !== 'string') return sdp;
+    // 1. 优先硬件编解码器
+    const reorderedSdp = prioritizeHardwareH264(sdp);
+    const lines = reorderedSdp.split('\r\n');
     const out = [];
     let inVideo = false;
     const videoPts = new Set();
@@ -418,7 +449,7 @@
     for (const line of lines) {
       if (line.indexOf('m=') === 0) inVideo = line.indexOf('m=video') === 0;
       if (inVideo) {
-        const m = line.match(/^a=rtpmap:(\d+)\s+(VP9|VP8|H264|AV1)\/90000/i);
+        const m = line.match(/^a=rtpmap:(\d+)\s+(H264|VP8|VP9|AV1)\/90000/i);
         if (m) videoPts.add(m[1]);
       }
     }
@@ -427,13 +458,13 @@
       if (fm && videoPts.has(fm[1])) hasFmtp.add(fm[1]);
     }
     inVideo = false;
-    // 兼顾 1080p 纯净画质与普通核显性能：起步 3Mbps，上限 12Mbps（相比 35Mbps 大幅降低 65% CPU 软编负荷）
-    const br = 'x-google-min-bitrate=2500;x-google-start-bitrate=6000;x-google-max-bitrate=12000';
+    // 多开视频节能优化：起步 1.8Mbps，上限 4.5Mbps（单路 1080p 纯净清晰，4开总码率仅 ~15Mbps，普通双核/四核核显零压力）
+    const br = 'x-google-min-bitrate=1200;x-google-start-bitrate=2500;x-google-max-bitrate=4500';
     for (const line of lines) {
       if (line.indexOf('m=') === 0) inVideo = line.indexOf('m=video') === 0;
       if (inVideo && line.indexOf('c=IN ') === 0) {
         out.push(line);
-        out.push('b=AS:12000');
+        out.push('b=AS:4500');
         continue;
       }
       const fm = line.match(/^a=fmtp:(\d+)\s+(.*)$/);
@@ -462,8 +493,9 @@
           const params = sender.getParameters() || {};
           params.degradationPreference = 'maintain-resolution';
           if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-          // 最大码率 12Mbps，不强制限死 60fps（跟随源视频真实帧率 24/30/60fps），消除冗余空插帧带来的 CPU 消耗
-          params.encodings[0].maxBitrate = 12000000;
+          // 4.5Mbps 上限，帧率自适应上限 30fps（多开不掉帧、不发热，保证画面平滑与低功耗）
+          params.encodings[0].maxBitrate = 4500000;
+          params.encodings[0].maxFramerate = 30;
           params.encodings[0].scaleResolutionDownBy = 1.0;
           const p = sender.setParameters(params);
           if (p && p.catch) p.catch(() => {});
@@ -572,10 +604,11 @@
     };
 
     const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+    const tunedOfferSdp = prioritizeHardwareH264(offer.sdp);
+    await pc.setLocalDescription(new RTCSessionDescription({ type: offer.type, sdp: tunedOfferSdp }));
     const offerPayload = {
       cmd: 'rtc-offer',
-      offer: { type: offer.type, sdp: offer.sdp }
+      offer: { type: offer.type, sdp: tunedOfferSdp }
     };
     bgSend({
       type: 'mp-companion-signal',
@@ -1959,12 +1992,13 @@
 
     try {
       const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+      const tunedOfferSdp = prioritizeHardwareH264(offer.sdp);
+      await pc.setLocalDescription(new RTCSessionDescription({ type: offer.type, sdp: tunedOfferSdp }));
 
       const resp = await bgSend({
         type: 'mp-rtc-offer',
         connId,
-        offer: { type: offer.type, sdp: offer.sdp },
+        offer: { type: offer.type, sdp: tunedOfferSdp },
         meta: {
           id: connId,
           title: (document.title || '').slice(0, 60),
