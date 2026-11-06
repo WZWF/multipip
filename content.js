@@ -637,15 +637,11 @@
 
   /** Dock mode: every video of the page shares one Document PiP window */
   async function popOutToDock(video) {
-    // 关键防御：Document PiP 规范严格规定只能在 top-level browsing context 调用
-    // 如果当前处于 iframe 子框架中，直接请求置顶小窗会触发 "Opening a Document Picture-in-Picture window is only allowed in a top-level browsing context"
-    // 因此在子框架中优先平滑降级至原生画中画（或独立窗口），保证任何嵌入式视频都能秒开且绝不报错！
+    // 关键架构：若当前视频位于 iframe 子框架内，由于浏览器限制子 frame 不能直接执行 requestWindow，
+    // 我们将其无缝转为通过本地 WebRTC 跨 frame 推流至顶层 Document PiP 坞，
+    // 从而保证多个视频能够完美合并在同一个小窗中并排/叠放显示，绝不被强制退回单视频原生画中画！
     if (window.self !== window.top) {
-      if (typeof video.requestPictureInPicture === 'function') {
-        popOutNative(video);
-        return;
-      }
-      popOutOwnWindow(video);
+      popOutCrossTabWebRTC(video);
       return;
     }
 
@@ -1905,6 +1901,14 @@
     const who = await bgSend({ type: 'mp-dock-who' });
     if (who && who.ok && who.ownerTabId != null) {
       dockOwnerId = who.ownerTabId;
+    } else {
+      // 当前尚无开启的 Document PiP 坞窗口：若处于 iframe 子框架中，请求顶层主 frame 协助代开
+      if (window.self !== window.top) {
+        const openResp = await bgSend({ type: 'mp-dock-open-top' });
+        if (openResp && openResp.ok) {
+          dockOwnerId = openResp.tabId;
+        }
+      }
     }
 
     pc.onicecandidate = (e) => {
@@ -2852,6 +2856,38 @@
       if (msg && msg.type === 'mp-cycle-speed') {
         sendResponse({ ok: cycleSpeedOfActive() });
         return true;
+      }
+      // Top frame: received request from child iframe to open Document PiP dock
+      if (msg && msg.type === 'mp-top-open-dock-request') {
+        if (!isTopFrame) {
+          sendResponse({ ok: false });
+          return false;
+        }
+        (async () => {
+          try {
+            if (dock && !dock.win.closed) {
+              sendResponse({ ok: true });
+              return;
+            }
+            const size = guessWindowSize([]);
+            const win = await window.documentPictureInPicture.requestWindow({
+              width: size.width,
+              height: size.height,
+            });
+            dock = { win, doc: win.document, list: [], body: null, cards: [] };
+            setupDockDoc(dock);
+            bgSend({ type: 'mp-dock-owner' });
+            win.addEventListener('pagehide', () => {
+              bgSend({ type: 'mp-release' });
+              recallDock();
+            });
+            sendResponse({ ok: true });
+          } catch (e) {
+            log('top frame open dock failed:', e);
+            sendResponse({ ok: false, error: String((e && e.message) || e) });
+          }
+        })();
+        return true; // async
       }
       // WebRTC Dock Owner: receive offer from source tab
       if (msg && msg.type === 'mp-rtc-offer') {

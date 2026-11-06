@@ -100,10 +100,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // 子框架请求顶层主窗口协助代开 Document PiP 坞窗口
+  if (msg.type === 'mp-dock-open-top') {
+    if (typeof tabId === 'number') {
+      chrome.tabs.sendMessage(tabId, { type: 'mp-top-open-dock-request' }, { frameId: 0 }, (resp) => {
+        const err = chrome.runtime.lastError;
+        if (err || !resp || !resp.ok) {
+          sendResponse({ ok: false, error: (err && err.message) || (resp && resp.error) || 'top frame rejected dock open' });
+        } else {
+          sendResponse({ ok: true, tabId });
+        }
+      });
+      return true; // async
+    }
+    sendResponse({ ok: false });
+    return true;
+  }
+
   // WebRTC signaling relay between source tab and dock owner tab
   if (msg.type === 'mp-rtc-offer') {
-    if (dockOwnerTabId != null && dockOwnerTabId !== tabId) {
-      chrome.tabs.sendMessage(dockOwnerTabId, {
+    const targetTab = (typeof msg.toTab === 'number') ? msg.toTab : dockOwnerTabId;
+    if (targetTab != null) {
+      chrome.tabs.sendMessage(targetTab, {
         type: 'mp-rtc-offer',
         offer: msg.offer,
         connId: msg.connId,
