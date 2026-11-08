@@ -17,7 +17,7 @@
   "background": {
     "service_worker": "background.js"
   },
-  "permissions": ["nativeMessaging", "windows"],
+  "permissions": ["nativeMessaging", "windows", "storage"],
   "commands": {
     "mp-cycle-speed": {
       "suggested_key": {

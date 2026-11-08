@@ -25,6 +25,9 @@
 /** tabId -> frameId that owns the tab's PiP window */
 const owners = new Map();
 
+/** tabId -> Map(frameId -> count of videos in frame) */
+const tabVideos = new Map();
+
 /** last tab that popped a video (speed-shortcut fallback target) */
 let lastVideoTabId = null;
 
@@ -97,6 +100,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'mp-dock-who') {
     sendResponse({ ok: true, ownerTabId: dockOwnerTabId, iAmOwner: dockOwnerTabId === null || dockOwnerTabId === tabId });
+    return true;
+  }
+
+  // 子框架或任意页面上报检测到的视频数量
+  if (msg.type === 'mp-report-videos') {
+    if (typeof tabId === 'number' && tabId >= 0) {
+      let frameMap = tabVideos.get(tabId);
+      if (!frameMap) {
+        frameMap = new Map();
+        tabVideos.set(tabId, frameMap);
+      }
+      frameMap.set(frameId, Number(msg.count) || 0);
+      let total = 0;
+      for (const cnt of frameMap.values()) total += cnt;
+      // 通知顶层 frame 该标签页内的总有效视频数
+      chrome.tabs.sendMessage(tabId, { type: 'mp-tab-video-count', total }, { frameId: 0 }, () => {
+        void chrome.runtime.lastError;
+      });
+    }
+    sendResponse({ ok: true });
     return true;
   }
 
@@ -373,6 +396,13 @@ function notifyCompanionClosed(tabId, id) {
 }
 
 /* ------------------------------- shortcuts ------------------------------- */
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  owners.delete(tabId);
+  tabVideos.delete(tabId);
+  if (dockOwnerTabId === tabId) dockOwnerTabId = null;
+  if (lastVideoTabId === tabId) lastVideoTabId = null;
+});
 
 /** Alt+Shift+S: cycle playback speed of the current video */
 chrome.commands.onCommand.addListener(async (command) => {

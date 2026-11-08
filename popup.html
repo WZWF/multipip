@@ -2,57 +2,203 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>&#x591A;&#x7A97;&#x64AD;&#x653E; Multi-PiP</title>
+<title>多窗播放 Multi-PiP</title>
 <style>
+  * { box-sizing: border-box; }
   body {
-    width: 300px;
+    width: 320px;
     margin: 0;
-    padding: 16px;
-    font: 13px/1.6 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    padding: 14px;
+    font: 13px/1.5 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
     background: #101018;
     color: #eee;
+    user-select: none;
+  }
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
   }
   h1 {
-    margin: 0 0 10px;
+    margin: 0;
     font-size: 15px;
+    font-weight: 700;
     background: linear-gradient(135deg, #6d5cff, #3aa0ff);
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
   }
-  ol {
-    margin: 0;
-    padding-left: 18px;
+  .version {
+    font-size: 11px;
+    color: rgba(255,255,255,0.4);
   }
-  li {
-    margin: 6px 0;
+  .sec-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.55);
+    margin: 10px 0 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
   }
-  kbd {
-    padding: 1px 6px;
-    border: 1px solid rgba(255,255,255,.25);
-    border-radius: 6px;
-    background: rgba(255,255,255,.08);
+  .mode-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .mode-card {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    cursor: pointer;
+    transition: all .16s ease;
+  }
+  .mode-card:hover {
+    background: rgba(255,255,255,0.12);
+    border-color: rgba(255,255,255,0.25);
+  }
+  .mode-card.active {
+    background: linear-gradient(135deg, rgba(109,92,255,0.28), rgba(58,160,255,0.22));
+    border-color: #6d5cff;
+    box-shadow: 0 0 12px rgba(109,92,255,0.35);
+  }
+  .mode-radio {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .mode-card.active .mode-radio {
+    border-color: #3aa0ff;
+  }
+  .mode-card.active .mode-radio::after {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #3aa0ff;
+  }
+  .mode-text {
+    flex: 1;
+    min-width: 0;
+  }
+  .mode-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .mode-desc {
+    font-size: 11px;
+    color: rgba(255,255,255,0.65);
+    margin-top: 2px;
+    line-height: 1.3;
+  }
+  .action-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .act-btn {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 7px 10px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.08);
+    color: #fff;
     font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all .16s ease;
   }
-  .foot {
+  .act-btn:hover {
+    background: rgba(255,255,255,0.18);
+    border-color: rgba(255,255,255,0.35);
+  }
+  .act-btn.primary {
+    background: linear-gradient(135deg, #6d5cff, #3aa0ff);
+    border: none;
+    font-weight: 600;
+  }
+  .act-btn.primary:hover {
+    box-shadow: 0 4px 14px rgba(80,80,255,0.4);
+  }
+  .tips {
     margin-top: 12px;
     padding-top: 10px;
-    border-top: 1px solid rgba(255,255,255,.12);
-    font-size: 12px;
-    opacity: .65;
+    border-top: 1px solid rgba(255,255,255,0.1);
+    font-size: 11.5px;
+    color: rgba(255,255,255,0.68);
+  }
+  .tips p {
+    margin: 4px 0;
+    line-height: 1.45;
+  }
+  kbd {
+    padding: 1px 5px;
+    border: 1px solid rgba(255,255,255,.25);
+    border-radius: 4px;
+    background: rgba(255,255,255,.08);
+    font: inherit;
+    color: #fff;
   }
 </style>
 </head>
 <body>
-  <h1>&#x591A;&#x7A97;&#x64AD;&#x653E; Multi-PiP</h1>
-  <ol>
-    <li>鼠标移至<strong>视频右上角角落</strong>点「独立播放」；或移至含视频网页的<strong>右侧边缘</strong>滑出「多窗播放」面板选择。</li>
-    <li><strong>原生小窗（多视频坞）</strong>：一个置顶无边框窗装多个视频，<strong>跨标签页也能合并</strong>；支持五种布局、顶部「⊞ 分屏」贴靠半屏/四分之一屏、每卡独立倍速/全屏控件。</li>
-    <li><strong>原生画中画</strong>：浏览器自带画中画窗，置顶，全局一个。</li>
-    <li><strong>无边框原生窗</strong>：真正的无边框置顶窗、可无限多开，支持多窗一键平铺排版（含半屏与 1/4 屏分屏贴靠）与外挂 SRT/VTT 字幕（首次使用双击 <code>companion/register_host.bat</code>）。</li>
-    <li>&#x500D;&#x901F;&#xFF1A;&#x575E;&#x5185;&#x5361;&#x7247;&#x63A7;&#x4EF6;&#x6761;&#xFF0C;&#x6216;&#x5FEB;&#x6377;&#x952E; <kbd>Alt+Shift+S</kbd>&#x3002;</li>
-    <li>&#x53EC;&#x56DE;&#xFF1A;<kbd>Esc</kbd>&#x3001;&#x5361;&#x7247; &#xD7;&#x3001;&#x6216;&#x70B9;&#x9875;&#x9762;&#x4E0A;&#x7684;&#x5360;&#x4F4D;&#x6761;&#x3002;</li>
-  </ol>
-  <div class="foot">&#x9700;&#x8981; Chrome/Edge 116+ &#x4E14;&#x9875;&#x9762; HTTPS&#x3002;Chrome &#x5168;&#x5C40;&#x53EA;&#x5141;&#x8BB8;&#x4E00;&#x4E2A;&#x7F6E;&#x9876;&#x753B;&#x4E2D;&#x753B;&#x7A97;&#xFF1B;&#x65E0;&#x8FB9;&#x6846;&#x539F;&#x751F;&#x7A97;&#x6A21;&#x5F0F;&#x4E0D;&#x53D7;&#x6B64;&#x9650;&#x3002;</div>
+  <div class="header">
+    <h1>🎬 多窗播放 Multi-PiP</h1>
+    <span class="version">v0.9.0</span>
+  </div>
+
+  <div class="sec-title">选择弹出播放模式</div>
+  <div class="mode-grid">
+    <div class="mode-card" data-mode="dock">
+      <div class="mode-radio"></div>
+      <div class="mode-text">
+        <div class="mode-name">❖ 原生小窗 (多视频坞)</div>
+        <div class="mode-desc">置顶多视频合一、跨标签合并、支持五种排版与半屏贴靠</div>
+      </div>
+    </div>
+    <div class="mode-card" data-mode="native">
+      <div class="mode-radio"></div>
+      <div class="mode-text">
+        <div class="mode-name">🗔 原生画中画</div>
+        <div class="mode-desc">浏览器内置纯净画中画，无标题栏，全局单窗</div>
+      </div>
+    </div>
+    <div class="mode-card" data-mode="companion">
+      <div class="mode-radio"></div>
+      <div class="mode-text">
+        <div class="mode-name">🗗 无边框原生窗</div>
+        <div class="mode-desc">真正无边框置顶多开、多窗一键平铺排版、外挂字幕</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="action-row">
+    <button class="act-btn primary" id="btnPopCurrent">▶ 弹出本页视频</button>
+    <button class="act-btn" id="btnRecallAll">↺ 全部召回</button>
+  </div>
+
+  <div class="tips">
+    <p>💡 <strong>触发方式</strong>：悬停视频右上角点「独立播放」或「▾」切换；亦可在页面右侧边缘点悬浮球展开控制面板。</p>
+    <p>⚡ <strong>快捷键</strong>：<kbd>Alt+Shift+S</kbd> 循环切倍速；<kbd>Esc</kbd> 召回视频。</p>
+  </div>
+
+  <script src="popup.js"></script>
 </body>
 </html>

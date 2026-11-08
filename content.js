@@ -41,12 +41,46 @@
   }
 
   /* ------------------------------- settings ------------------------------- */
+  let currentMode = 'dock';
+  try {
+    const saved = localStorage.getItem(NS + ':mode');
+    if (saved) currentMode = saved;
+  } catch (e) {}
+
+  if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+    chrome.storage.local.get(['multipip_mode'], (res) => {
+      if (res && res.multipip_mode) {
+        currentMode = res.multipip_mode;
+        try { localStorage.setItem(NS + ':mode', currentMode); } catch (e) {}
+        if (typeof renderModeBar === 'function') renderModeBar();
+        if (typeof updateAllBadgesUI === 'function') updateAllBadgesUI();
+        if (typeof refreshStates === 'function') refreshStates();
+      }
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && changes.multipip_mode) {
+        currentMode = changes.multipip_mode.newValue || 'dock';
+        try { localStorage.setItem(NS + ':mode', currentMode); } catch (e) {}
+        if (typeof renderModeBar === 'function') renderModeBar();
+        if (typeof updateAllBadgesUI === 'function') updateAllBadgesUI();
+        if (typeof refreshStates === 'function') refreshStates();
+      }
+    });
+  }
+
   const modeStore = {
     get() {
-      try { return localStorage.getItem(NS + ':mode') || 'dock'; } catch (e) { return 'dock'; }
+      return currentMode;
     },
     set(v) {
-      try { localStorage.setItem(NS + ':mode', v); } catch (e) { /* private mode */ }
+      currentMode = v;
+      try { localStorage.setItem(NS + ':mode', v); } catch (e) {}
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.set({ multipip_mode: v });
+      }
+      if (typeof renderModeBar === 'function') renderModeBar();
+      if (typeof updateAllBadgesUI === 'function') updateAllBadgesUI();
+      if (typeof refreshStates === 'function') refreshStates();
     },
   };
 
@@ -187,14 +221,23 @@
   }
 
   function fallbackNativePiP(video) {
-    if (typeof video.requestPictureInPicture !== 'function') {
-      toast('\u5f53\u524d\u6d4f\u89c8\u5668\u4e0d\u652f\u6301\u753b\u4e2d\u753b\uff0c\u65e0\u6cd5\u5f39\u51fa');
+    if (typeof video.requestPictureInPicture === 'function') {
+      video.requestPictureInPicture().then(() => {
+        nativePopped.add(video);
+        lastPopped = video;
+        video.addEventListener('leavepictureinpicture', () => {
+          nativePopped.delete(video);
+          refreshStates();
+        });
+        log('native PiP fallback success');
+        refreshStates();
+      }).catch((e) => {
+        log('native PiP failed, fallback to standalone window:', e);
+        popOutOwnWindow(video);
+      });
       return;
     }
-    video.requestPictureInPicture().catch((e) => {
-      log('native PiP failed', e);
-      toast('\u6d4f\u89c8\u5668\u753b\u4e2d\u753b\u4e5f\u5931\u8d25\u4e86\uff1a' + (e?.message || e));
-    });
+    popOutOwnWindow(video);
   }
 
   function saveHome(video, extra) {
@@ -312,7 +355,7 @@
   }
 
   /* ------------------------------ pop entry ------------------------------ */
-  async function popOut(video) {
+  async function popOut(video, preferredMode) {
     if (homes.has(video)) {
       toast('\u8fd9\u4e2a\u89c6\u9891\u5df2\u7ecf\u5728\u64ad\u653e\u7a97\u91cc\u4e86');
       return;
@@ -327,37 +370,40 @@
     }
     if (pending.has(video)) return;
     pending.add(video);
-    bgSend({ type: 'mp-note' }); // remember this tab for the speed shortcut
+    try { bgSend({ type: 'mp-note' }); } catch (e) {} // remember this tab for the speed shortcut
     try {
-      const mode = modeStore.get();
+      const mode = preferredMode || modeStore.get();
       if (mode === 'companion') {
         popOutCompanion(video);
-        return;
-      }
-      if (modeStore.get() === 'dock') {
-        const who = await bgSend({ type: 'mp-dock-who' });
-        if (who && who.ok && who.ownerTabId != null && who.iAmOwner === false) {
-          popOutCrossTabWebRTC(video); // universal cross-tab WebRTC stream to dock
-        } else {
-          await popOutToDock(video);
-        }
         return;
       }
       if (mode === 'native') {
         popOutNative(video);
         return;
       }
-      if (!pipSupported()) {
-        if (mode === 'window') {
-          popOutOwnWindow(video);
-          return;
-        }
-        toast('\u9700\u8981 Chrome/Edge 116+ \u4e14\u9875\u9762\u4e3a HTTPS\uff1b\u9000\u56de\u7cfb\u7edf\u753b\u4e2d\u753b\uff08\u6bcf\u4e2a\u6807\u7b7e\u9875\u4e00\u4e2a\uff09');
-        fallbackNativePiP(video);
-        return;
-      }
       if (mode === 'window') {
         popOutOwnWindow(video);
+        return;
+      }
+
+      // Dock mode
+      if (window.self !== window.top) {
+        // 子框架中由于浏览器规范不允许 requestWindow，检查顶层或其它标签页是否已有开启的小窗坞
+        const who = await bgSend({ type: 'mp-dock-who' });
+        if (who && who.ok && who.ownerTabId != null) {
+          popOutCrossTabWebRTC(video);
+        } else {
+          // 当前尚无开启的 Document PiP 坞，子框架直接以原生画中画即时弹出，绝不报错或黑屏！
+          log('iframe dock popup: no dock open, popping native PiP directly');
+          popOutNative(video);
+          toast('\u5df2\u5728\u753b\u4e2d\u753b\u5f39\u51fa\uff08\u82e5\u9700\u591a\u89c6\u9891\u5408\u5165\u5c0f\u7a97\uff0c\u53ef\u5148\u5728\u4e3b\u9875\u9762\u5f00\u542f\u7f6e\u9876\u5c0f\u7a97\uff09', 3600);
+        }
+        return;
+      }
+
+      if (!pipSupported()) {
+        toast('\u5f53\u524d\u9875\u9762\u73af\u5883\u4e0d\u652f\u6301\u539f\u751f\u5c0f\u7a97\uff0c\u5df2\u4f7f\u7528\u753b\u4e2d\u753b\u5f39\u51fa');
+        fallbackNativePiP(video);
         return;
       }
       await popOutToDock(video);
@@ -372,7 +418,8 @@
    *  cleanest SINGLE always-on-top window experience. */
   function popOutNative(video) {
     if (typeof video.requestPictureInPicture !== 'function') {
-      toast('\u5f53\u524d\u6d4f\u89c8\u5668\u4e0d\u652f\u6301\u7cfb\u7edf\u753b\u4e2d\u753b');
+      toast('\u5f53\u524d\u6d4f\u89c8\u5668\u4e0d\u652f\u6301\u7cfb\u7edf\u753b\u4e2d\u753b\uff0c\u4f7f\u7528\u72ec\u7acb\u7a97\u53e3\u6253\u5f00');
+      popOutOwnWindow(video);
       return;
     }
     video.requestPictureInPicture().then(() => {
@@ -380,14 +427,16 @@
       lastPopped = video;
       video.addEventListener('leavepictureinpicture', onLeave);
       log('native piP:', (video.currentSrc || '').slice(0, 60));
+      refreshStates();
     }).catch((e) => {
-      log('native PiP failed', e);
-      toast('\u7cfb\u7edf\u753b\u4e2d\u753b\u5931\u8d25\uff1a' + (e?.message || e));
+      log('native PiP failed, fallback to own window', e);
+      popOutOwnWindow(video);
     });
     function onLeave() {
       nativePopped.delete(video);
       video.removeEventListener('leavepictureinpicture', onLeave);
       log('native piP exited');
+      refreshStates();
     }
   }
 
@@ -638,9 +687,6 @@
 
   /** Dock mode: every video of the page shares one Document PiP window */
   async function popOutToDock(video) {
-    // 关键架构：若当前视频位于 iframe 子框架内，由于浏览器限制子 frame 不能直接执行 requestWindow，
-    // 我们将其无缝转为通过本地 WebRTC 跨 frame 推流至顶层 Document PiP 坞，
-    // 从而保证多个视频能够完美合并在同一个小窗中并排/叠放显示，绝不被强制退回单视频原生画中画！
     if (window.self !== window.top) {
       popOutCrossTabWebRTC(video);
       return;
@@ -649,15 +695,6 @@
     if (dock && dock.win.closed) dock = null;
     if (dock) {
       addToDock(video, dock);
-      return;
-    }
-
-    // Another frame of this tab may already own the tab's only PiP window;
-    // opening another would close it. Ask the background coordinator.
-    const claim = await bgSend({ type: 'mp-claim' });
-    if (claim && claim.ok === false) {
-      toast('\u672c\u6807\u7b7e\u9875\u5df2\u6709\u4e00\u4e2a\u7f6e\u9876\u7a97\uff08\u6765\u81ea\u9875\u9762\u7684\u5176\u4ed6\u90e8\u5206\uff1bChrome \u5168\u5c40\u4ec5\u5141\u8bb8\u4e00\u4e2a\uff09\u3002\u8fd9\u4e2a\u89c6\u9891\u6539\u7528\u72ec\u7acb\u7a97\u53e3\u6253\u5f00\uff0c\u5df2\u6709\u7a97\u53e3\u4e0d\u53d7\u5f71\u54cd', 3600);
-      popOutOwnWindow(video);
       return;
     }
 
@@ -671,7 +708,6 @@
         return;
       }
       if (!dock) {
-        // the in-flight open fell back to native PiP
         fallbackNativePiP(video);
         return;
       }
@@ -1902,14 +1938,14 @@
     const who = await bgSend({ type: 'mp-dock-who' });
     if (who && who.ok && who.ownerTabId != null) {
       dockOwnerId = who.ownerTabId;
-    } else {
-      // 当前尚无开启的 Document PiP 坞窗口：若处于 iframe 子框架中，请求顶层主 frame 协助代开
-      if (window.self !== window.top) {
-        const openResp = await bgSend({ type: 'mp-dock-open-top' });
-        if (openResp && openResp.ok) {
-          dockOwnerId = openResp.tabId;
-        }
-      }
+    }
+
+    if (dockOwnerId == null) {
+      log('no open dock window found for cross-tab WebRTC stream, fallback to native PiP');
+      try { pc.close(); } catch (e) {}
+      popOutNative(video);
+      toast('\u5f53\u524d\u65e0\u5df2\u5f00\u542f\u7684\u7f6e\u9876\u5c0f\u7a97\uff0c\u5df2\u4f7f\u7528\u753b\u4e2d\u753b\u5f39\u51fa', 3200);
+      return;
     }
 
     pc.onicecandidate = (e) => {
@@ -1983,8 +2019,8 @@
         dockCrossPopped.delete(video);
         dockCrossIds.delete(video);
         refreshStates();
-        log('mp-rtc-offer send failed, trying embed fallback');
-        popOutEmbed(video);
+        log('mp-rtc-offer send failed, falling back to native PiP');
+        popOutNative(video);
       } else {
         hideCrossSourceVideo(video);
       }
@@ -1996,8 +2032,8 @@
       dockCrossPopped.delete(video);
       dockCrossIds.delete(video);
       refreshStates();
-      log('WebRTC offer negotiation error:', err);
-      popOutEmbed(video);
+      log('WebRTC offer negotiation error, falling back to native PiP:', err);
+      popOutNative(video);
     }
   }
 
@@ -2148,44 +2184,163 @@
     return cachedVideos;
   }
 
+  const MODE_TITLES = {
+    dock: '❖ 原生小窗 (多视频坞)',
+    native: '🗔 原生画中画',
+    companion: '🗗 无边框原生窗',
+  };
+
+  function updateAllBadgesUI() {
+    for (const b of badges.values()) {
+      if (b && typeof b._updateUI === 'function') b._updateUI();
+    }
+  }
+
   function ensureBadge(video) {
     let b = badges.get(video);
     if (b) return b;
     b = document.createElement('div');
-    b.textContent = '\u72ec\u7acb\u64ad\u653e';
+    b.className = NS + 'badge-wrap';
     Object.assign(b.style, {
       position: 'absolute',
       display: 'none',
       pointerEvents: 'auto',
-      cursor: 'pointer',
-      padding: '4px 10px',
-      borderRadius: '8px',
-      whiteSpace: 'nowrap',
-      background: 'rgba(12,12,20,.78)',
-      backdropFilter: 'blur(6px)',
-      color: '#fff',
-      font: '12px/1.5 system-ui, "Microsoft YaHei", sans-serif',
-      border: '1px solid rgba(255,255,255,.2)',
-      boxShadow: '0 2px 12px rgba(0,0,0,.35)',
+      zIndex: '2147483646',
       userSelect: 'none',
+      font: '12px/1.5 system-ui, "Microsoft YaHei", sans-serif',
       opacity: '0',
       transition: 'opacity .15s ease',
     });
-    b.addEventListener('mouseenter', () => {
-      b.dataset.hover = '1';
-      b.style.background = 'rgba(109,92,255,.92)';
+
+    const pill = document.createElement('div');
+    Object.assign(pill.style, {
+      display: 'inline-flex',
+      alignItems: 'center',
+      borderRadius: '8px',
+      background: 'rgba(12,12,20,.88)',
+      backdropFilter: 'blur(8px)',
+      border: '1px solid rgba(255,255,255,.24)',
+      boxShadow: '0 3px 14px rgba(0,0,0,.5)',
+      overflow: 'hidden',
     });
-    b.addEventListener('mouseleave', () => {
-      b.dataset.hover = '';
-      b.style.background = 'rgba(12,12,20,.78)';
-      hideBadge(b);
+
+    const btnMain = document.createElement('button');
+    btnMain.textContent = '🎬 独立播放';
+    btnMain.title = '弹出播放（当前：' + (MODE_TITLES[modeStore.get()] || '原生小窗') + '）';
+    Object.assign(btnMain.style, {
+      cursor: 'pointer',
+      border: 'none',
+      background: 'transparent',
+      color: '#fff',
+      padding: '4px 8px 4px 10px',
+      font: 'inherit',
+      fontWeight: '600',
+      fontSize: '12px',
+      whiteSpace: 'nowrap',
     });
-    b.addEventListener('click', (ev) => {
+    btnMain.addEventListener('mouseenter', () => { btnMain.style.background = 'rgba(109,92,255,.8)'; });
+    btnMain.addEventListener('mouseleave', () => { btnMain.style.background = 'transparent'; });
+    btnMain.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
+      menu.style.display = 'none';
       hideBadge(b);
       popOut(video);
     });
+
+    const btnArrow = document.createElement('button');
+    btnArrow.textContent = '▾';
+    btnArrow.title = '选择弹出模式（小窗/画中画/无边框）';
+    Object.assign(btnArrow.style, {
+      cursor: 'pointer',
+      border: 'none',
+      borderLeft: '1px solid rgba(255,255,255,.2)',
+      background: 'transparent',
+      color: 'rgba(255,255,255,.85)',
+      padding: '4px 8px',
+      font: 'inherit',
+      fontSize: '11px',
+    });
+    btnArrow.addEventListener('mouseenter', () => { btnArrow.style.background = 'rgba(255,255,255,.2)'; });
+    btnArrow.addEventListener('mouseleave', () => { btnArrow.style.background = 'transparent'; });
+
+    const menu = document.createElement('div');
+    Object.assign(menu.style, {
+      position: 'absolute',
+      top: 'calc(100% + 4px)',
+      right: '0',
+      display: 'none',
+      width: '185px',
+      padding: '5px',
+      borderRadius: '8px',
+      background: 'rgba(16,18,26,0.96)',
+      backdropFilter: 'blur(10px)',
+      border: '1px solid rgba(255,255,255,.25)',
+      boxShadow: '0 8px 24px rgba(0,0,0,.65)',
+      zIndex: '999999',
+    });
+
+    function renderMenu() {
+      menu.innerHTML = '';
+      const cur = modeStore.get();
+      [
+        ['dock', '❖ 原生小窗 (多视频坞)'],
+        ['native', '🗔 原生画中画'],
+        ['companion', '🗗 无边框原生窗'],
+      ].forEach(([k, label]) => {
+        const item = document.createElement('div');
+        item.textContent = (cur === k ? '✓ ' : '  ') + label;
+        Object.assign(item.style, {
+          padding: '6px 8px',
+          borderRadius: '5px',
+          color: '#fff',
+          cursor: 'pointer',
+          fontSize: '11.5px',
+          fontWeight: cur === k ? '600' : 'normal',
+          background: cur === k ? 'rgba(109,92,255,.35)' : 'transparent',
+          whiteSpace: 'nowrap',
+        });
+        item.addEventListener('mouseenter', () => { item.style.background = 'rgba(255,255,255,.18)'; });
+        item.addEventListener('mouseleave', () => {
+          item.style.background = cur === k ? 'rgba(109,92,255,.35)' : 'transparent';
+        });
+        item.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          modeStore.set(k);
+          menu.style.display = 'none';
+          hideBadge(b);
+          popOut(video, k);
+        });
+        menu.appendChild(item);
+      });
+    }
+
+    const toggleMenu = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const show = menu.style.display === 'none';
+      if (show) renderMenu();
+      menu.style.display = show ? 'block' : 'none';
+    };
+
+    btnArrow.addEventListener('click', toggleMenu);
+    b.addEventListener('contextmenu', toggleMenu);
+
+    b.addEventListener('mouseenter', () => { b.dataset.hover = '1'; });
+    b.addEventListener('mouseleave', () => {
+      b.dataset.hover = '';
+      menu.style.display = 'none';
+      hideBadge(b);
+    });
+
+    pill.append(btnMain, btnArrow);
+    b.append(pill, menu);
+    b._updateUI = () => {
+      const cur = modeStore.get();
+      btnMain.title = '弹出播放（当前：' + (MODE_TITLES[cur] || '原生小窗') + '）';
+    };
+
     overlay.appendChild(b);
     badges.set(video, b);
     return b;
@@ -2198,6 +2353,7 @@
     } else {
       b.style.opacity = '1';
     }
+    if (typeof b._updateUI === 'function') b._updateUI();
   }
 
   function hideBadge(b) {
@@ -2215,8 +2371,7 @@
     return homes.has(v) || nativePopped.has(v) || companionPopped.has(v) || dockCrossPopped.has(v);
   }
 
-  /** 仅当鼠标真正移入有效视频画面的「右上角小热区」时才返回该视频；
-   *  全屏播放、已弹出视频、过小预览缩略图或鼠标在视频中央/进度条区域时一律返回 null */
+  /** 鼠标移入有效视频画面的「右上角区域」时显示控制气泡 */
   function findTopRightCornerVideo(clientX, clientY) {
     if (document.fullscreenElement || document.webkitFullscreenElement) return null;
     const list = getCachedVideos();
@@ -2224,12 +2379,11 @@
       const v = list[i];
       if (!v.isConnected || isVideoPopped(v)) continue;
       const r = v.getBoundingClientRect();
-      // 过滤过小的封面动图、表情包或微小预览视频
-      if (r.width < 220 || r.height < 130) continue;
+      if (r.width < 160 || r.height < 90) continue;
       if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) continue;
-      // 右上角热区：距右边缘 128px 以内、距上边缘 54px 以内
-      const zoneW = Math.min(128, r.width * 0.35);
-      const zoneH = Math.min(54, r.height * 0.3);
+      // 容错度更好的右上区域热区：右侧 45% 或 280px，上方 35% 或 120px
+      const zoneW = Math.max(160, Math.min(280, r.width * 0.45));
+      const zoneH = Math.max(64, Math.min(120, r.height * 0.35));
       if (
         clientX >= r.right - zoneW &&
         clientX <= r.right &&
@@ -2253,14 +2407,14 @@
       }
       const r = v.getBoundingClientRect();
       if (
-        r.width < 220 || r.height < 130 ||
+        r.width < 160 || r.height < 90 ||
         r.bottom < 0 || r.top > innerHeight ||
         r.right < 0 || r.left > innerWidth
       ) {
         hideBadge(b);
         continue;
       }
-      const bw = b.offsetWidth || 72;
+      const bw = b.offsetWidth || 110;
       b.style.left = Math.max(4, Math.round(r.right - bw - 10)) + 'px';
       b.style.top = Math.round(r.top + 10) + 'px';
       anyVisible = true;
@@ -2311,13 +2465,14 @@
   })();
   let fabDismissed = false;
   let fabHovered = false;
+  let reportedTabVideoCount = 0;
 
   const fab = document.createElement('div');
   fab.id = NS + 'fab';
   Object.assign(fab.style, {
     position: 'fixed',
-    right: '0px',
-    bottom: '20px',
+    right: '16px',
+    bottom: '22px',
     zIndex: '2147483647',
     display: 'none', // 默认隐藏，仅在顶层页面检测到有效视频时自动显现
     flexDirection: 'column',
@@ -2332,12 +2487,11 @@
     display: 'inline-flex',
     alignItems: 'center',
     pointerEvents: 'auto',
-    borderRadius: '999px 0 0 999px',
+    borderRadius: '999px',
     background: 'linear-gradient(135deg,#6d5cff,#3aa0ff)',
-    boxShadow: '0 4px 16px rgba(60,60,220,.32)',
-    transform: 'translateX(calc(100% - 28px))',
-    opacity: '0.45',
-    transition: 'transform .24s cubic-bezier(.2,.8,.2,1), opacity .24s ease, box-shadow .24s ease',
+    boxShadow: '0 4px 18px rgba(60,60,220,.4)',
+    opacity: '0.85',
+    transition: 'all .2s cubic-bezier(.2,.8,.2,1)',
     overflow: 'hidden',
     userSelect: 'none',
   });
@@ -2348,7 +2502,7 @@
   Object.assign(fabBtn.style, {
     cursor: 'pointer',
     border: 'none',
-    padding: '7px 8px 7px 11px',
+    padding: '8px 10px 8px 13px',
     color: '#fff',
     fontWeight: '600',
     fontSize: '12.5px',
@@ -2364,7 +2518,7 @@
     cursor: 'pointer',
     border: 'none',
     borderLeft: '1px solid rgba(255,255,255,.22)',
-    padding: '7px 9px 7px 7px',
+    padding: '8px 10px 8px 8px',
     color: 'rgba(255,255,255,.85)',
     fontSize: '14px',
     lineHeight: '1',
@@ -2381,7 +2535,7 @@
   Object.assign(panel.style, {
     display: 'none',
     pointerEvents: 'auto',
-    marginRight: '12px',
+    marginRight: '0px',
     width: '320px',
     maxHeight: '60vh',
     overflow: 'auto',
@@ -2400,13 +2554,13 @@
   function syncFabDockState() {
     const isOpen = panel.style.display !== 'none';
     if (fabHovered || isOpen) {
-      fabPill.style.transform = 'translateX(0)';
       fabPill.style.opacity = '1';
-      fabPill.style.boxShadow = '0 6px 20px rgba(80,80,255,.45)';
+      fabPill.style.transform = 'scale(1.04)';
+      fabPill.style.boxShadow = '0 6px 22px rgba(80,80,255,.55)';
     } else {
-      fabPill.style.transform = 'translateX(calc(100% - 28px))';
-      fabPill.style.opacity = '0.45';
-      fabPill.style.boxShadow = '0 4px 16px rgba(60,60,220,.32)';
+      fabPill.style.opacity = '0.85';
+      fabPill.style.transform = 'scale(1)';
+      fabPill.style.boxShadow = '0 4px 18px rgba(60,60,220,.4)';
     }
   }
 
@@ -2427,7 +2581,9 @@
       companionPopped.size > 0 ||
       dockCrossPopped.size > 0
     );
-    const count = typeof videoCount === 'number' ? videoCount : collectVideos().length;
+    const count = typeof videoCount === 'number'
+      ? videoCount
+      : Math.max(collectVideos().length, reportedTabVideoCount);
     if (count > 0 || hasActivePop) {
       fab.style.display = 'flex';
       syncFabDockState();
@@ -2670,22 +2826,26 @@
   function renderModeBar() {
     modeBar.textContent = '';
     const cur = modeStore.get();
-    [['dock', '\u539f\u751f\u5c0f\u7a97'], ['native', '\u539f\u751f\u753b\u4e2d\u753b'], ['companion', '\u65e0\u8fb9\u6846\u7a97']].forEach(([key, label]) => {
+    [['dock', '❖ \u539f\u751f\u5c0f\u7a97'], ['native', '🗔 \u539f\u751f\u753b\u4e2d\u753b'], ['companion', '🗗 \u65e0\u8fb9\u6846\u7a97']].forEach(([key, label]) => {
       const b = document.createElement('button');
       b.textContent = label;
       b.title = MODE_HINT[key];
+      const active = cur === key;
       Object.assign(b.style, {
         flex: '1',
         cursor: 'pointer',
         border: 'none',
         borderRadius: '8px',
-        padding: '6px 0',
+        padding: '7px 0',
         font: 'inherit',
+        fontSize: '11.5px',
+        fontWeight: active ? '600' : 'normal',
         color: '#fff',
         background:
-          cur === key
+          active
             ? 'linear-gradient(135deg,#6d5cff,#3aa0ff)'
             : 'rgba(255,255,255,.12)',
+        boxShadow: active ? '0 2px 10px rgba(109,92,255,.45)' : 'none',
       });
       b.addEventListener('click', () => {
         modeStore.set(key);
@@ -2842,53 +3002,55 @@
   }
 
   // 定时检测当前页面是否有有效视频，控制边缘悬浮球显隐，并在面板展开时自动刷新状态
+  function reportVideosToBg() {
+    try {
+      const n = collectVideos().length;
+      bgSend({ type: 'mp-report-videos', count: n });
+    } catch (e) {}
+  }
   updateFabVisibility();
+  reportVideosToBg();
   setInterval(() => {
     const n = collectVideos().length;
+    reportVideosToBg();
     updateFabVisibility(n);
     if (panel.style.display === 'none') return;
     if (n !== lastCount) renderPanel();
     else refreshStates();
   }, 1200);
 
-  // Speed shortcut from the service worker (Alt+Shift+S)
+  // Speed shortcut & popup commands from service worker / toolbar popup
   if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg && msg.type === 'mp-cycle-speed') {
         sendResponse({ ok: cycleSpeedOfActive() });
         return true;
       }
-      // Top frame: received request from child iframe to open Document PiP dock
-      if (msg && msg.type === 'mp-top-open-dock-request') {
-        if (!isTopFrame) {
-          sendResponse({ ok: false });
-          return false;
+      if (msg && msg.type === 'mp-tab-video-count') {
+        reportedTabVideoCount = Number(msg.total) || 0;
+        updateFabVisibility();
+        return true;
+      }
+      if (msg && msg.type === 'mp-set-mode') {
+        if (msg.mode) {
+          modeStore.set(msg.mode);
         }
-        (async () => {
-          try {
-            if (dock && !dock.win.closed) {
-              sendResponse({ ok: true });
-              return;
-            }
-            const size = guessWindowSize([]);
-            const win = await window.documentPictureInPicture.requestWindow({
-              width: size.width,
-              height: size.height,
-            });
-            dock = { win, doc: win.document, list: [], body: null, cards: [] };
-            setupDockDoc(dock);
-            bgSend({ type: 'mp-dock-owner' });
-            win.addEventListener('pagehide', () => {
-              bgSend({ type: 'mp-release' });
-              recallDock();
-            });
-            sendResponse({ ok: true });
-          } catch (e) {
-            log('top frame open dock failed:', e);
-            sendResponse({ ok: false, error: String((e && e.message) || e) });
-          }
-        })();
-        return true; // async
+        return true;
+      }
+      if (msg && msg.type === 'mp-pop-first') {
+        const list = collectVideos();
+        if (list.length > 0) popOut(list[0]);
+        else toast('\u672c\u9875\u9762\u672a\u53d1\u73b0\u53ef\u5f39\u51fa\u7684\u6709\u6548\u89c6\u9891');
+        return true;
+      }
+      if (msg && msg.type === 'mp-recall-all') {
+        recallDock();
+        for (const v of Array.from(nativePopped)) recallNative(v);
+        for (const v of Array.from(companionPopped.keys())) recallCompanion(v);
+        for (const v of Array.from(dockCrossPopped)) recallCrossDock(v);
+        refreshStates();
+        toast('\u5df2\u53ec\u56de\u5168\u90e8\u89c6\u9891');
+        return true;
       }
       // WebRTC Dock Owner: receive offer from source tab
       if (msg && msg.type === 'mp-rtc-offer') {
