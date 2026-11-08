@@ -893,8 +893,22 @@
         }
         return;
       }
-      if (e.key === 'ArrowLeft') { e.preventDefault(); card.ctl && card.ctl.seek(Math.max(0, card.ctl.time() - 5)); }
-      if (e.key === 'ArrowRight') { e.preventDefault(); card.ctl && card.ctl.seek(card.ctl.time() + 5); }
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        if (card.ctl) {
+          card.ctl.seek(Math.max(0, card.ctl.time() - 5));
+          if (card.bar && typeof card.bar._sync === 'function') card.bar._sync();
+        }
+        return;
+      }
+      if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        if (card.ctl) {
+          card.ctl.seek(card.ctl.time() + 5);
+          if (card.bar && typeof card.bar._sync === 'function') card.bar._sync();
+        }
+        return;
+      }
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
         e.preventDefault();
         const i = d.cards.indexOf(card);
@@ -1501,7 +1515,16 @@
       const v = card.video;
       return {
         toggle: () => { if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } else v.pause(); },
-        seek: (t) => { try { v.currentTime = Math.max(0, t); } catch (e) {} },
+        seek: (t) => {
+          try {
+            if (Number.isFinite(t)) {
+              v.currentTime = Math.max(0, t);
+              v.dispatchEvent(new Event('seeking'));
+            }
+          } catch (e) {
+            log('seek error:', e);
+          }
+        },
         speed: (r) => { v.playbackRate = r; },
         volume: (x) => { v.volume = Math.min(1, Math.max(0, x)); v.muted = x <= 0; },
         paused: () => v.paused,
@@ -1511,12 +1534,21 @@
     }
     return {
       toggle: () => relay('toggle'),
-      seek: (t) => relay('seek', Math.max(0, t)),
+      seek: (t) => {
+        try { card.lastSync.currentTime = t; } catch (e) {}
+        relay('seek', Math.max(0, t));
+      },
       speed: (r) => relay('speed', r),
-      volume: (x) => relay('volume', x),
-      paused: () => card.media.paused,
-      time: () => card.media.currentTime,
-      duration: () => (card.meta && card.meta.duration) || card.media.duration || 0,
+      volume: (x) => {
+        try {
+          card.media.volume = Math.min(1, Math.max(0, x));
+          card.media.muted = x <= 0;
+        } catch (e) {}
+        relay('volume', x);
+      },
+      paused: () => (card.lastSync ? card.lastSync.paused : card.media.paused),
+      time: () => (card.lastSync ? card.lastSync.currentTime : card.media.currentTime),
+      duration: () => (card.lastSync && card.lastSync.duration) || (card.meta && card.meta.duration) || card.media.duration || 0,
     };
   }
 
@@ -1568,17 +1600,61 @@
     const fsBtn = mk('\u26f6', '\u5168\u5c4f\uff08\u5360\u6ee1\u7a97\u53e3\uff09', () => enterFullscreen(d, card));
     const recallBtn = mk('\u00d7', card.kind === 'adopt' ? '\u53ec\u56de\uff08\u653e\u56de\u539f\u9875\u9762\uff09' : '\u5173\u95ed\u5e76\u53ec\u56de\u6e90', () => recallCard(d, card));
 
-    seek.addEventListener('input', () => {
+    let isSeeking = false;
+    const commitSeek = () => {
       const dur = ctl.duration();
-      if (dur > 0 && isFinite(dur)) ctl.seek((Number(seek.value) / 1000) * dur);
+      if (dur > 0 && Number.isFinite(dur)) {
+        const target = (Number(seek.value) / 1000) * dur;
+        ctl.seek(target);
+      }
+    };
+
+    seek.addEventListener('mousedown', (e) => { e.stopPropagation(); isSeeking = true; });
+    seek.addEventListener('touchstart', (e) => { e.stopPropagation(); isSeeking = true; }, { passive: true });
+    seek.addEventListener('input', (e) => {
+      e.stopPropagation();
+      const dur = ctl.duration();
+      if (dur > 0 && Number.isFinite(dur)) {
+        const preview = (Number(seek.value) / 1000) * dur;
+        timeLabel.textContent = fmtTime(preview) + ' / ' + fmtTime(dur);
+      }
+      commitSeek();
     });
-    vol.addEventListener('input', () => ctl.volume(Number(vol.value)));
+    seek.addEventListener('change', (e) => {
+      e.stopPropagation();
+      isSeeking = false;
+      commitSeek();
+      sync();
+    });
+    seek.addEventListener('mouseup', (e) => {
+      e.stopPropagation();
+      if (isSeeking) {
+        isSeeking = false;
+        commitSeek();
+        sync();
+      }
+    });
+    seek.addEventListener('touchend', (e) => {
+      e.stopPropagation();
+      if (isSeeking) {
+        isSeeking = false;
+        commitSeek();
+        sync();
+      }
+    });
+
+    vol.addEventListener('click', (e) => e.stopPropagation());
+    vol.addEventListener('input', (e) => {
+      e.stopPropagation();
+      ctl.volume(Number(vol.value));
+    });
 
     const sync = () => {
+      if (isSeeking) return; // 正在拖动进度条时不被播放回调强制打断
       const dur = ctl.duration();
       const t = ctl.time();
       playBtn.textContent = ctl.paused() ? '\u25b6' : '\u23f8';
-      if (dur > 0 && isFinite(dur)) {
+      if (dur > 0 && Number.isFinite(dur)) {
         seek.value = String(Math.round((t / dur) * 1000));
         timeLabel.textContent = fmtTime(t) + ' / ' + fmtTime(dur);
       } else {
@@ -1689,7 +1765,10 @@
 
     card.ctl = {
       toggle: () => relay('toggle'),
-      seek: (t) => relay('seek', Math.max(0, t)),
+      seek: (t) => {
+        try { card.lastSync.currentTime = t; } catch (e) {}
+        relay('seek', Math.max(0, t));
+      },
       speed: (r) => relay('speed', r),
       volume: (x) => {
         try {
@@ -2256,6 +2335,29 @@
           pauseSourceVideo(lastPopped);
           toast('\u5df2\u6682\u505c \u23f8', 1000);
         }
+        return;
+      }
+    }
+
+    // 3. 方向键左右: 快退 / 快进 5 秒
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      const delta = e.key === 'ArrowLeft' ? -5 : 5;
+      if (dock && !dock.win.closed && dock.cards && dock.cards.length > 0) {
+        e.preventDefault();
+        const card = dock.focused || dock.cards[0];
+        if (card && card.ctl) {
+          card.ctl.seek(Math.max(0, card.ctl.time() + delta));
+          if (card.bar && typeof card.bar._sync === 'function') card.bar._sync();
+          toast(delta < 0 ? '\u5feb\u9000 -5s ⏪' : '\u5feb\u8fdb +5s ⏩', 800);
+        }
+        return;
+      }
+      if (lastPopped && (nativePopped.has(lastPopped) || companionPopped.has(lastPopped) || homes.has(lastPopped))) {
+        e.preventDefault();
+        try {
+          lastPopped.currentTime = Math.max(0, lastPopped.currentTime + delta);
+          toast(delta < 0 ? '\u5feb\u9000 -5s ⏪' : '\u5feb\u8fdb +5s ⏩', 800);
+        } catch (err) {}
         return;
       }
     }
@@ -3308,7 +3410,13 @@
             else pauseSourceVideo(v);
           }
           else if (msg.op === 'seek') {
-            try { v.currentTime = Number(msg.value) || 0; } catch (e) {}
+            try {
+              const val = Number(msg.value);
+              if (Number.isFinite(val)) {
+                v.currentTime = Math.max(0, val);
+                v.dispatchEvent(new Event('seeking'));
+              }
+            } catch (e) {}
             if (!v.paused) playSourceVideo(v);
           }
           else if (msg.op === 'speed') { v.playbackRate = Number(msg.value) || 1; }
