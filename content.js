@@ -165,6 +165,7 @@
    */
   const homes = new WeakMap();
   const pending = new Set(); // guards against double-click double pops
+  const launching = new Set();
 
   /** videos currently living in the browser's NATIVE video PiP window */
   const nativePopped = new Set();
@@ -333,7 +334,8 @@
 
   function insertPlaceholder(video, home) {
     const div = document.createElement('div');
-    div.textContent = '\u89c6\u9891\u5df2\u5f39\u51fa\u5230\u72ec\u7acb\u7a97\u53e3\u64ad\u653e \u00b7 \u70b9\u51fb\u53ec\u56de';
+    div.tabIndex = 0;
+    div.textContent = '\u89c6\u9891\u5df2\u5f39\u51fa\u64ad\u653e \u00b7 \u70b9\u51fb\u6216\u6309\u7a7a\u683c/Esc\u53ec\u56de';
     Object.assign(div.style, {
       padding: '18px 12px',
       textAlign: 'center',
@@ -342,8 +344,16 @@
       color: '#fff',
       font: '13px/1.5 system-ui, "Microsoft YaHei", sans-serif',
       cursor: 'pointer',
+      outline: 'none',
     });
-    div.addEventListener('click', () => restoreVideo(video));
+    const doRecall = () => restoreVideo(video);
+    div.addEventListener('click', doRecall);
+    div.addEventListener('keydown', (e) => {
+      if (e.key === ' ' || e.key === 'Enter' || e.key === 'Escape') {
+        e.preventDefault();
+        doRecall();
+      }
+    });
     home.placeholder = div;
     if (home.parent) {
       if (home.next && home.next.parentNode === home.parent) {
@@ -357,7 +367,7 @@
   /* ------------------------------ pop entry ------------------------------ */
   async function popOut(video, preferredMode) {
     if (homes.has(video)) {
-      toast('\u8fd9\u4e2a\u89c6\u9891\u5df2\u7ecf\u5728\u64ad\u653e\u7a97\u91cc\u4e86');
+      toast('\u8fd9\u4e2a\u89c6\u9891\u5df2\u7ecf\u5728\u591a\u89c6\u9891\u575e\u91cc\u4e86');
       return;
     }
     if (nativePopped.has(video)) {
@@ -368,13 +378,17 @@
       toast('\u8fd9\u4e2a\u89c6\u9891\u5df2\u7ecf\u5728\u65e0\u8fb9\u6846\u7a97\u91cc\u4e86');
       return;
     }
-    if (pending.has(video)) return;
+    if (pending.has(video) || launching.has(video)) {
+      toast('\u6b63\u5728\u6253\u5f00\u7a97\u53e3\uff0c\u8bf7\u7a0d\u5019...', 1000);
+      return;
+    }
     pending.add(video);
+    launching.add(video);
     try { bgSend({ type: 'mp-note' }); } catch (e) {} // remember this tab for the speed shortcut
     try {
-      const mode = preferredMode || modeStore.get();
+      const mode = preferredMode || modeStore.get() || 'dock';
       if (mode === 'companion') {
-        popOutCompanion(video);
+        await popOutCompanion(video);
         return;
       }
       if (mode === 'native') {
@@ -386,29 +400,11 @@
         return;
       }
 
-      // Dock mode
-      if (window.self !== window.top) {
-        // 子框架中由于浏览器规范不允许 requestWindow，检查顶层或其它标签页是否已有开启的小窗坞
-        const who = await bgSend({ type: 'mp-dock-who' });
-        if (who && who.ok && who.ownerTabId != null) {
-          popOutCrossTabWebRTC(video);
-        } else {
-          // 当前尚无开启的 Document PiP 坞，子框架直接以原生画中画即时弹出，绝不报错或黑屏！
-          log('iframe dock popup: no dock open, popping native PiP directly');
-          popOutNative(video);
-          toast('\u5df2\u5728\u753b\u4e2d\u753b\u5f39\u51fa\uff08\u82e5\u9700\u591a\u89c6\u9891\u5408\u5165\u5c0f\u7a97\uff0c\u53ef\u5148\u5728\u4e3b\u9875\u9762\u5f00\u542f\u7f6e\u9876\u5c0f\u7a97\uff09', 3600);
-        }
-        return;
-      }
-
-      if (!pipSupported()) {
-        toast('\u5f53\u524d\u9875\u9762\u73af\u5883\u4e0d\u652f\u6301\u539f\u751f\u5c0f\u7a97\uff0c\u5df2\u4f7f\u7528\u753b\u4e2d\u753b\u5f39\u51fa');
-        fallbackNativePiP(video);
-        return;
-      }
+      // Default: Dock mode (原生多视频坞)
       await popOutToDock(video);
     } finally {
       pending.delete(video);
+      setTimeout(() => { launching.delete(video); }, 800);
     }
   }
 
@@ -688,7 +684,28 @@
   /** Dock mode: every video of the page shares one Document PiP window */
   async function popOutToDock(video) {
     if (window.self !== window.top) {
-      popOutCrossTabWebRTC(video);
+      // 检查顶层或其他标签页是否已有开启的小窗坞
+      const who = await bgSend({ type: 'mp-dock-who' });
+      if (who && who.ok && who.ownerTabId != null) {
+        await popOutCrossTabWebRTC(video);
+        return;
+      }
+      // 当前尚无开启的坞：优先尝试由顶层开启 Document PiP 坞
+      const size = guessWindowSize([video]);
+      let win = await tryTopLevelPiP(size);
+      if (win) {
+        setupDockWindow(win, video);
+        return;
+      }
+      // 若受同源策略阻止，以独立小窗承载多视频坞（具备多视频合并与排版功能）
+      try {
+        win = window.open('', '_blank', `popup=yes,width=${size.width},height=${size.height}`);
+      } catch (e) {}
+      if (win) {
+        setupDockWindow(win, video);
+        return;
+      }
+      fallbackNativePiP(video);
       return;
     }
 
@@ -733,17 +750,26 @@
       height: size.height,
     };
     try {
-      win = await window.documentPictureInPicture.requestWindow(opts);
+      if (typeof window.documentPictureInPicture?.requestWindow === 'function') {
+        win = await window.documentPictureInPicture.requestWindow(opts);
+      }
     } catch (err) {
       log('requestWindow failed', err);
+    }
+    if (!win) {
       win = await tryTopLevelPiP(size);
-      if (!win) {
-        bgSend({ type: 'mp-release' });
-        // 遇到顶层上下文限制或受限页面时，静默平滑降级到系统画中画，不弹出令人生畏的红字报错
-        log('dock window unavailable, graceful fallback to native PiP');
-        fallbackNativePiP(video);
-        return;
-      }
+    }
+    // 若系统/环境限制无法使用 Document PiP，平滑以独立弹窗承载多视频坞（100% 具备多视频合一、宫格排版与独立控制条功能）
+    if (!win) {
+      try {
+        win = window.open('', '_blank', `popup=yes,width=${size.width},height=${size.height}`);
+      } catch (e) {}
+    }
+    if (!win) {
+      bgSend({ type: 'mp-release' });
+      log('dock window unavailable, graceful fallback to native PiP');
+      fallbackNativePiP(video);
+      return;
     }
     setupDockWindow(win, video);
   }
@@ -845,6 +871,7 @@
 
     doc.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
+        e.preventDefault();
         if (d.fullscreen) {
           exitFullscreen(d);
           return;
@@ -858,6 +885,14 @@
       }
       const card = d.focused || d.cards[0];
       if (!card) return;
+      if (e.key === ' ' || e.code === 'Space') {
+        e.preventDefault();
+        if (card.ctl) {
+          card.ctl.toggle();
+          if (card.bar && typeof card.bar._sync === 'function') card.bar._sync();
+        }
+        return;
+      }
       if (e.key === 'ArrowLeft') { e.preventDefault(); card.ctl && card.ctl.seek(Math.max(0, card.ctl.time() - 5)); }
       if (e.key === 'ArrowRight') { e.preventDefault(); card.ctl && card.ctl.seek(card.ctl.time() + 5); }
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
@@ -1844,8 +1879,9 @@
 
     // 3. 原视频位置放置占位提示
     const placeholder = document.createElement('div');
+    placeholder.tabIndex = 0;
     placeholder.setAttribute('data-mp-cross-ph', '1');
-    placeholder.textContent = '\u89c6\u9891\u5df2\u5f39\u51fa\u5230\u7f6e\u9876\u5c0f\u7a97\u64ad\u653e \u00b7 \u70b9\u51fb\u53ec\u56de';
+    placeholder.textContent = '\u89c6\u9891\u5df2\u5f39\u51fa\u5230\u7f6e\u9876\u5c0f\u7a97\u64ad\u653e \u00b7 \u70b9\u51fb\u6216\u6309\u7a7a\u683c/Esc\u53ec\u56de';
     Object.assign(placeholder.style, {
       position: 'absolute',
       inset: '0',
@@ -1858,10 +1894,18 @@
       cursor: 'pointer',
       zIndex: '9999',
       userSelect: 'none',
+      outline: 'none',
     });
-    placeholder.addEventListener('click', () => {
+    const doRecall = () => {
       if (companionPopped.has(video)) recallCompanion(video);
       else recallCrossDock(video);
+    };
+    placeholder.addEventListener('click', doRecall);
+    placeholder.addEventListener('keydown', (e) => {
+      if (e.key === ' ' || e.key === 'Enter' || e.key === 'Escape') {
+        e.preventDefault();
+        doRecall();
+      }
     });
 
     const parent = video.parentNode;
@@ -2136,7 +2180,15 @@
 
     doc.body.appendChild(stage);
     doc.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') restoreVideo(video);
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        restoreVideo(video);
+      }
+      if (e.key === ' ' || e.code === 'Space') {
+        e.preventDefault();
+        if (video.paused) video.play().catch(() => {});
+        else video.pause();
+      }
     });
     win.addEventListener('pagehide', () => restoreVideo(video, { keepWindow: true }));
     lastPopped = video;
@@ -2157,6 +2209,57 @@
     toast('\u500d\u901f ' + v.playbackRate + 'x', 1200);
     return true;
   }
+
+  /* ---------------------- keyboard shortcuts on page ---------------------- */
+  document.addEventListener('keydown', (e) => {
+    const el = e.target;
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+
+    // 1. ESC: 召回当前弹出的视频（取消弹出）
+    if (e.key === 'Escape') {
+      const hasActive = Boolean(
+        (dock && !dock.win.closed) ||
+        nativePopped.size > 0 ||
+        companionPopped.size > 0 ||
+        dockCrossPopped.size > 0
+      );
+      if (hasActive) {
+        e.preventDefault();
+        recallDock();
+        for (const v of Array.from(nativePopped)) recallNative(v);
+        for (const v of Array.from(companionPopped.keys())) recallCompanion(v);
+        for (const v of Array.from(dockCrossPopped)) recallCrossDock(v);
+        refreshStates();
+        toast('\u5df2\u53ec\u56de\u89c6\u9891\u81f3\u539f\u9875\u9762', 1500);
+        return;
+      }
+    }
+
+    // 2. 空格键: 切换当前已弹出视频的播放 / 暂停
+    if (e.key === ' ' || e.code === 'Space') {
+      if (dock && !dock.win.closed && dock.cards && dock.cards.length > 0) {
+        e.preventDefault();
+        const card = dock.focused || dock.cards[0];
+        if (card && card.ctl) {
+          card.ctl.toggle();
+          if (card.bar && typeof card.bar._sync === 'function') card.bar._sync();
+          toast(card.ctl.paused() ? '\u5df2\u6682\u505c \u23f8' : '\u7ee7\u7eed\u64ad\u653e \u25b6', 1000);
+        }
+        return;
+      }
+      if (lastPopped && (nativePopped.has(lastPopped) || companionPopped.has(lastPopped) || homes.has(lastPopped))) {
+        e.preventDefault();
+        if (lastPopped.paused) {
+          playSourceVideo(lastPopped);
+          toast('\u7ee7\u7eed\u64ad\u653e \u25b6', 1000);
+        } else {
+          pauseSourceVideo(lastPopped);
+          toast('\u5df2\u6682\u505c \u23f8', 1000);
+        }
+        return;
+      }
+    }
+  }, true);
 
   /* ------------------------------ hover badge ------------------------------ */
   const overlay = document.createElement('div');
@@ -2224,9 +2327,10 @@
       overflow: 'hidden',
     });
 
+    const cur = modeStore.get();
     const btnMain = document.createElement('button');
-    btnMain.textContent = '🎬 独立播放';
-    btnMain.title = '弹出播放（当前：' + (MODE_TITLES[modeStore.get()] || '原生小窗') + '）';
+    btnMain.textContent = (cur === 'dock' ? '🎬 原生小窗' : cur === 'native' ? '🗔 原生画中画' : '🗗 无边框窗');
+    btnMain.title = '弹出播放（当前：' + (MODE_TITLES[cur] || '原生小窗') + '）';
     Object.assign(btnMain.style, {
       cursor: 'pointer',
       border: 'none',
@@ -2337,8 +2441,9 @@
     pill.append(btnMain, btnArrow);
     b.append(pill, menu);
     b._updateUI = () => {
-      const cur = modeStore.get();
-      btnMain.title = '弹出播放（当前：' + (MODE_TITLES[cur] || '原生小窗') + '）';
+      const c = modeStore.get();
+      btnMain.textContent = (c === 'dock' ? '🎬 原生小窗' : c === 'native' ? '🗔 原生画中画' : '🗗 无边框窗');
+      btnMain.title = '弹出播放（当前：' + (MODE_TITLES[c] || '原生小窗') + '）';
     };
 
     overlay.appendChild(b);
