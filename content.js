@@ -172,7 +172,7 @@
 
   /** cross-tab dock sources: id -> { video, wasPlaying } (this tab) */
   const dockStreamSources = new Map();
-  let nextDockSourceId = 1;
+  let nextDockSourceId = Date.now() % 1000000;
 
   /** videos merged into the dock via stream relay (this tab, panel state) */
   const dockCrossPopped = new Set();
@@ -1496,10 +1496,20 @@
 
     slot.addEventListener('mouseenter', () => { d.focused = card; });
 
+    // 绑定原生 video 自身事件，严格只刷新此 card 内部的 bar，互不干扰
     const sync = () => { if (card.bar && card.bar._sync) card.bar._sync(); };
-    media.addEventListener('timeupdate', sync);
-    media.addEventListener('play', sync);
-    media.addEventListener('pause', sync);
+    media.addEventListener('timeupdate', (e) => {
+      e.stopPropagation();
+      sync();
+    });
+    media.addEventListener('play', (e) => {
+      e.stopPropagation();
+      sync();
+    });
+    media.addEventListener('pause', (e) => {
+      e.stopPropagation();
+      sync();
+    });
     if (opts.kind === 'stream') {
       media.addEventListener('playing', () => log('stream viewer: playing'));
       media.addEventListener('error', () => log('stream viewer: error:', media.error && media.error.message));
@@ -3361,6 +3371,7 @@
       if (msg && msg.type === 'mp-dock-meta-sync') {
         if (dock && dock.cards) {
           const card = dock.cards.find((c) =>
+            c.kind === 'rtc' &&
             (msg.fromTab != null ? c.sourceTabId === msg.fromTab : true) &&
             (c.connId === msg.connId || (c.meta && c.meta.id === msg.connId))
           );
