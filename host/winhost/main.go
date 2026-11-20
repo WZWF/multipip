@@ -1,18 +1,30 @@
 // Multi-PiP Win32 window host
 // -----------------------------------------------------------------------------
-// 极简常驻宿主：只做"把 Chrome popup 窗口置顶/取消置顶"这一件事。
-// 不承载任何渲染、不内嵌 WebView2，常驻内存约 3MB。
+// 极简常驻宿主，只做三件与"窗口外形/层级"有关的事，不承载任何渲染：
+//   1. 把目标窗口设为 HWND_TOPMOST
+//   2. 用 SetWindowRgn 精确裁掉 Chrome popup 的标题/地址栏区域（只留页面客户区，可圆角）
+//   3. 接管原生拖动与等比缩放（裁边后窗口自身的边框被切掉，必须由宿主接手）
 //
 // 协议：Chrome Native Messaging（stdin/stdout，4 字节小端长度 + UTF-8 JSON）
 //
-//	{"cmd":"ping"}                              -> {"ok":true,"ver":"..."}
-//	{"cmd":"attach","token":"...","topmost":1}   -> 按窗口标题里的 token 找到 HWND 并置顶
-//	{"cmd":"detach","token":"..."}               -> 取消置顶
-//	{"cmd":"detachAll"}                          -> 清理全部
-//	{"cmd":"quit"}                               -> 退出（退出前自动清理）
+//	{"cmd":"ping"}                                  -> {"ok":true,"ver":"..."}
+//	{"cmd":"attach","token":"...","topmost":1,       -> 认领窗口；cut=1 时立即裁剪
+//	                 "cut":1,"radius":10,"class":"..."}
+//	{"cmd":"setcut","token":"...","cut":0|1,"radius":10}
+//	{"cmd":"drag","token":"..."}                     -> 原生拖动循环（松开左键自动结束）
+//	{"cmd":"resize","token":"...","aspect":1.7778}   -> 等比缩放循环（按住左键期间）
+//	{"cmd":"status","token":"..."}                   -> 调试：是否已置顶/已裁剪
+//	{"cmd":"detach","token":"..."}                   -> 取消置顶 + 还原窗口区域
+//	{"cmd":"detachAll"} / {"cmd":"quit"}
 //
-// 窗口识别：扩展把唯一 token 写进 document.title，这里按标题子串匹配
-// Chrome_WidgetWin_1 顶层窗口。窗口刚创建时可能还不存在，attach 会自动重试 3 秒。
+// 窗口识别：扩展把唯一 token 写进 document.title，这里按标题子串匹配顶层窗口，
+// 默认只匹配 Chrome 系窗口类（可用 class 字段覆盖，便于用记事本做无人验证）。
+//
+// 关键实现取舍：
+//   - stdin EOF 时【不】还原置顶/区域。MV3 service worker 空闲被回收会断开管道，
+//     若此时还原，用户会看到窗口突然掉出置顶。
+//   - 裁剪区每 400ms 校验一次（EqualRgn 比较），Chrome 因重绘/换 DPI/改尺寸重置
+//     Region 时自动补刷，无需 SetWinEventHook。
 package main
 
 import (
@@ -29,38 +41,75 @@ import (
 	"unsafe"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 const (
 	swpNoSize     = 0x0001
 	swpNoMove     = 0x0002
-	swpNoActivate = 0x0010
 	swpNoZOrder   = 0x0004
+	swpNoActivate = 0x0010
+
+	vkLButton = 0x01
+
+	// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (DPI_AWARENESS_CONTEXT)-4
+	dpiAwarenessPerMonitorV2 = ^uintptr(3)
 )
 
 var (
 	user32 = syscall.NewLazyDLL("user32.dll")
+	gdi32  = syscall.NewLazyDLL("gdi32.dll")
 
-	procEnumWindows      = user32.NewProc("EnumWindows")
-	procIsWindowVisible  = user32.NewProc("IsWindowVisible")
-	procGetWindowTextW   = user32.NewProc("GetWindowTextW")
-	procGetWindowTextLen = user32.NewProc("GetWindowTextLengthW")
-	procGetClassNameW    = user32.NewProc("GetClassNameW")
-	procSetWindowPos     = user32.NewProc("SetWindowPos")
-	procIsWindow         = user32.NewProc("IsWindow")
+	procEnumWindows        = user32.NewProc("EnumWindows")
+	procIsWindowVisible    = user32.NewProc("IsWindowVisible")
+	procIsWindow           = user32.NewProc("IsWindow")
+	procGetWindowTextW     = user32.NewProc("GetWindowTextW")
+	procGetWindowTextLen   = user32.NewProc("GetWindowTextLengthW")
+	procGetClassNameW      = user32.NewProc("GetClassNameW")
+	procSetWindowPos       = user32.NewProc("SetWindowPos")
+	procGetWindowRect      = user32.NewProc("GetWindowRect")
+	procGetClientRect      = user32.NewProc("GetClientRect")
+	procClientToScreen     = user32.NewProc("ClientToScreen")
+	procGetCursorPos       = user32.NewProc("GetCursorPos")
+	procGetAsyncKeyState   = user32.NewProc("GetAsyncKeyState")
+	procSetWindowRgn       = user32.NewProc("SetWindowRgn")
+	procGetWindowRgn       = user32.NewProc("GetWindowRgn")
+	procSetDpiCtx          = user32.NewProc("SetProcessDpiAwarenessContext")
+	procSetDpiAware        = user32.NewProc("SetProcessDPIAware")
+	procCreateRectRgn      = gdi32.NewProc("CreateRectRgn")
+	procCreateRoundRectRgn = gdi32.NewProc("CreateRoundRectRgn")
+	procDeleteObject       = gdi32.NewProc("DeleteObject")
+	procEqualRgn           = gdi32.NewProc("EqualRgn")
 )
 
+type point struct{ X, Y int32 }
+type rect struct{ Left, Top, Right, Bottom int32 }
+
 type request struct {
-	Cmd     string `json:"cmd"`
-	Token   string `json:"token"`
-	Topmost *int   `json:"topmost"`
+	Cmd     string  `json:"cmd"`
+	Token   string  `json:"token"`
+	Class   string  `json:"class"`
+	Topmost *int    `json:"topmost"`
+	Cut     *int    `json:"cut"`
+	Radius  *int    `json:"radius"`
+	Aspect  float64 `json:"aspect"`
+}
+
+type target struct {
+	token   string
+	hwnd    uintptr
+	topmost bool
+	cut     bool
+	radius  int
+	done    chan struct{} // detach / 重挂时关闭，停了区域巡检
+	loop    chan struct{} // 拖动/缩放的会话（新的会打断旧的）
 }
 
 var (
 	mu      sync.Mutex
-	tracked = map[string]uintptr{} // token -> hwnd
-	outMu   sync.Mutex
-	out     = os.Stdout
+	targets = map[string]*target{}
+
+	outMu sync.Mutex
+	out   = os.Stdout
 )
 
 func send(v interface{}) {
@@ -76,85 +125,304 @@ func send(v interface{}) {
 	_, _ = out.Write(b)
 }
 
+func call(proc *syscall.LazyProc, args ...uintptr) uintptr {
+	r, _, _ := proc.Call(args...)
+	return r
+}
+
+func ptr(v unsafe.Pointer) uintptr { return uintptr(v) }
+
 func winText(hwnd uintptr) string {
-	n := int(mustCall(procGetWindowTextLen, hwnd))
+	n := int(call(procGetWindowTextLen, hwnd))
 	if n <= 0 {
 		return ""
 	}
 	buf := make([]uint16, n+1)
-	mustCall(procGetWindowTextW, hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	call(procGetWindowTextW, hwnd, ptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 	return syscall.UTF16ToString(buf)
 }
 
 func winClass(hwnd uintptr) string {
 	buf := make([]uint16, 256)
-	mustCall(procGetClassNameW, hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	call(procGetClassNameW, hwnd, ptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 	return syscall.UTF16ToString(buf)
 }
 
-func mustCall(proc *syscall.LazyProc, args ...uintptr) uintptr {
-	r, _, _ := proc.Call(args...)
-	return r
-}
-
 func isAlive(hwnd uintptr) bool {
-	if hwnd == 0 {
-		return false
-	}
-	return mustCall(procIsWindow, hwnd) != 0
+	return hwnd != 0 && call(procIsWindow, hwnd) != 0
 }
 
-// findWindow 在所有可见的 Chrome 顶层窗口里找标题含 token 的那个。
-func findWindow(token string) uintptr {
+func windowRect(hwnd uintptr) (rect, bool) {
+	var r rect
+	return r, call(procGetWindowRect, hwnd, ptr(unsafe.Pointer(&r))) != 0
+}
+
+func clientRect(hwnd uintptr) (rect, bool) {
+	var r rect
+	return r, call(procGetClientRect, hwnd, ptr(unsafe.Pointer(&r))) != 0
+}
+
+func clientOrigin(hwnd uintptr) (point, bool) {
+	var p point
+	return p, call(procClientToScreen, hwnd, ptr(unsafe.Pointer(&p))) != 0
+}
+
+func cursorPos() point {
+	var p point
+	call(procGetCursorPos, ptr(unsafe.Pointer(&p)))
+	return p
+}
+
+func lbuttonDown() bool {
+	return call(procGetAsyncKeyState, vkLButton)&0x8000 != 0
+}
+
+// findWindow 在所有可见的指定类名顶层窗口里找标题含 token 的那个。
+func findWindow(token, class string) uintptr {
 	if token == "" {
 		return 0
 	}
+	classes := map[string]bool{}
+	if class != "" {
+		classes[class] = true
+	} else {
+		classes["Chrome_WidgetWin_1"] = true
+		classes["Chrome_WidgetWin_0"] = true
+	}
+
 	var found uintptr
 	cb := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
-		if mustCall(procIsWindowVisible, hwnd) == 0 {
+		if call(procIsWindowVisible, hwnd) == 0 {
 			return 1
 		}
-		cls := winClass(hwnd)
-		if cls != "Chrome_WidgetWin_1" && cls != "Chrome_WidgetWin_0" {
+		if !classes[winClass(hwnd)] {
 			return 1
 		}
 		if strings.Contains(winText(hwnd), token) {
 			found = hwnd
-			return 0 // 停止枚举
+			return 0
 		}
 		return 1
 	})
-	procEnumWindows.Call(cb, 0)
+	call(procEnumWindows, cb, 0)
 	return found
 }
 
-func applyTopmost(hwnd uintptr, on bool) bool {
-	if !isAlive(hwnd) {
-		return false
+// ---------------------------------------------------------------------------
+// Region：只保留"页面客户区"，把 Chrome 自绘的标题/地址栏条和不可见边框一起切掉
+// ---------------------------------------------------------------------------
+
+func computeRegion(hwnd uintptr, radius int) (uintptr, bool, string) {
+	wr, ok1 := windowRect(hwnd)
+	cr, ok2 := clientRect(hwnd)
+	co, ok3 := clientOrigin(hwnd)
+	if !ok1 || !ok2 || !ok3 {
+		return 0, false, "get rect failed"
 	}
-	var after uintptr
-	if on {
-		after = ^uintptr(0) // HWND_TOPMOST (-1)
+	w := cr.Right - cr.Left
+	h := cr.Bottom - cr.Top
+	if w < 80 || h < 60 {
+		return 0, false, fmt.Sprintf("client too small %dx%d", w, h)
+	}
+	left := int32(co.X) - wr.Left
+	top := int32(co.Y) - wr.Top
+	r := radius
+	if r < 0 {
+		r = 0
+	}
+	if int32(r*2) >= w || int32(r*2) >= h {
+		r = 0
+	}
+	// 四周各留 1px，避免边缘出现 1px 白线/灰线
+	x1, y1 := left-1, top-1
+	x2, y2 := left+w+1, top+h+1
+	var hRgn uintptr
+	if r > 0 {
+		hRgn = call(procCreateRoundRectRgn,
+			uintptr(x1), uintptr(y1), uintptr(x2), uintptr(y2),
+			uintptr(r*2), uintptr(r*2))
 	} else {
-		after = ^uintptr(1) // HWND_NOTOPMOST (-2)
+		hRgn = call(procCreateRectRgn, uintptr(x1), uintptr(y1), uintptr(x2), uintptr(y2))
 	}
-	flags := uintptr(swpNoMove | swpNoSize | swpNoActivate)
-	r := mustCall(procSetWindowPos, hwnd, after, 0, 0, 0, 0, flags)
-	return r != 0
+	if hRgn == 0 {
+		return 0, false, "CreateRgn failed"
+	}
+	return hRgn, true, ""
 }
 
-// attachWithRetry 解决"窗口晚于 attach 指令出现"的竞态。
-func attachWithRetry(token string, on bool) (uintptr, bool) {
-	for i := 0; i < 30; i++ {
-		if hwnd := findWindow(token); hwnd != 0 {
-			if applyTopmost(hwnd, on) {
-				return hwnd, true
-			}
-			return 0, false
-		}
-		time.Sleep(100 * time.Millisecond)
+func regionMatches(hwnd, want uintptr) bool {
+	cur := call(procCreateRectRgn, 0, 0, 1, 1)
+	if cur == 0 {
+		return false
 	}
-	return 0, false
+	defer call(procDeleteObject, cur)
+	got := call(procGetWindowRgn, hwnd, cur)
+	if got < 2 { // 0=ERROR 1=NULLREGION
+		return false
+	}
+	return call(procEqualRgn, cur, want) != 0
+}
+
+func applyRegion(t *target) (bool, string) {
+	if !isAlive(t.hwnd) {
+		return false, "window gone"
+	}
+	mu.Lock()
+	cut, radius := t.cut, t.radius
+	mu.Unlock()
+	if !cut {
+		call(procSetWindowRgn, t.hwnd, 0, 1)
+		return true, "cleared"
+	}
+	rgn, ok, err := computeRegion(t.hwnd, radius)
+	if !ok {
+		return false, err
+	}
+	if regionMatches(t.hwnd, rgn) {
+		call(procDeleteObject, rgn)
+		return true, "unchanged"
+	}
+	if call(procSetWindowRgn, t.hwnd, rgn, 1) == 0 {
+		call(procDeleteObject, rgn) // 失败时 rgn 仍归调用方所有
+		return false, "SetWindowRgn failed"
+	}
+	return true, "applied"
+}
+
+// watchRegion 每 400ms 校验一次：Chrome 重绘/换 DPI/改尺寸会把 Region 丢掉，这里补刷。
+func watchRegion(t *target) {
+	tk := time.NewTicker(400 * time.Millisecond)
+	defer tk.Stop()
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-tk.C:
+			if !isAlive(t.hwnd) {
+				return
+			}
+			mu.Lock()
+			cut := t.cut
+			mu.Unlock()
+			if cut {
+				_, _ = applyRegion(t)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 原生拖动 / 等比缩放
+// ---------------------------------------------------------------------------
+
+func dragLoop(t *target, stop chan struct{}) {
+	start := cursorPos()
+	wr, ok := windowRect(t.hwnd)
+	if !ok {
+		return
+	}
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		if !isAlive(t.hwnd) || !lbuttonDown() {
+			return
+		}
+		p := cursorPos()
+		nx := wr.Left + (p.X - start.X)
+		ny := wr.Top + (p.Y - start.Y)
+		call(procSetWindowPos, t.hwnd, 0,
+			uintptr(nx), uintptr(ny), 0, 0,
+			uintptr(swpNoSize|swpNoZOrder|swpNoActivate))
+		time.Sleep(8 * time.Millisecond)
+	}
+}
+
+func resizeLoop(t *target, aspect float64, stop chan struct{}) {
+	start := cursorPos()
+	wr, ok := windowRect(t.hwnd)
+	if !ok {
+		return
+	}
+	startW := int(wr.Right - wr.Left)
+	startH := int(wr.Bottom - wr.Top)
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		if !isAlive(t.hwnd) || !lbuttonDown() {
+			return
+		}
+		p := cursorPos()
+		w := startW + int(p.X-start.X)
+		if w < 240 {
+			w = 240
+		}
+		var h int
+		if aspect > 0.2 {
+			h = int(float64(w) / aspect)
+		} else {
+			h = startH + int(p.Y-start.Y)
+		}
+		if h < 140 {
+			h = 140
+		}
+		call(procSetWindowPos, t.hwnd, 0, 0, 0,
+			uintptr(w), uintptr(h),
+			uintptr(swpNoMove|swpNoZOrder|swpNoActivate))
+		time.Sleep(8 * time.Millisecond)
+	}
+}
+
+func stopLoop(t *target) {
+	mu.Lock()
+	ch := t.loop
+	t.loop = nil
+	mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+func startLoop(t *target) chan struct{} {
+	stopLoop(t)
+	ch := make(chan struct{})
+	mu.Lock()
+	t.loop = ch
+	mu.Unlock()
+	return ch
+}
+
+// ---------------------------------------------------------------------------
+// commands
+// ---------------------------------------------------------------------------
+
+func lookup(token string) *target {
+	mu.Lock()
+	defer mu.Unlock()
+	return targets[token]
+}
+
+func clearWindow(t *target) {
+	if t == nil {
+		return
+	}
+	stopLoop(t)
+	if isAlive(t.hwnd) {
+		call(procSetWindowPos, t.hwnd, ^uintptr(1), 0, 0, 0, 0,
+			uintptr(swpNoMove|swpNoSize|swpNoActivate))
+		call(procSetWindowRgn, t.hwnd, 0, 1)
+	}
+	mu.Lock()
+	if t.done != nil {
+		close(t.done)
+		t.done = nil
+	}
+	mu.Unlock()
 }
 
 func handle(req request) {
@@ -167,49 +435,139 @@ func handle(req request) {
 		if req.Topmost != nil {
 			on = *req.Topmost != 0
 		}
+		cut := false
+		if req.Cut != nil {
+			cut = *req.Cut != 0
+		}
+		radius := 10
+		if req.Radius != nil {
+			radius = *req.Radius
+		}
 		go func() {
-			hwnd, ok := attachWithRetry(req.Token, on)
-			if !ok {
+			var hwnd uintptr
+			for i := 0; i < 30; i++ {
+				if hwnd = findWindow(req.Token, req.Class); hwnd != 0 {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			if hwnd == 0 {
 				send(map[string]interface{}{"ok": false, "token": req.Token, "error": "window not found"})
 				return
 			}
-			mu.Lock()
 			if on {
-				tracked[req.Token] = hwnd
-			} else {
-				delete(tracked, req.Token)
+				call(procSetWindowPos, hwnd, ^uintptr(0), 0, 0, 0, 0,
+					uintptr(swpNoMove|swpNoSize|swpNoActivate))
 			}
+			if old := lookup(req.Token); old != nil {
+				clearWindow(old)
+			}
+			t := &target{
+				token: req.Token, hwnd: hwnd, topmost: on,
+				cut: cut, radius: radius, done: make(chan struct{}),
+			}
+			mu.Lock()
+			targets[req.Token] = t
 			mu.Unlock()
+
+			state, msg := applyRegion(t)
+			if cut {
+				go watchRegion(t)
+			}
 			send(map[string]interface{}{
 				"ok": true, "token": req.Token, "hwnd": fmt.Sprintf("0x%x", hwnd),
-				"topmost": on, "title": winText(hwnd),
+				"topmost": on, "cut": cut, "radius": radius,
+				"region": msg, "regionOk": state, "title": winText(hwnd),
 			})
 		}()
 
+	case "setcut":
+		t := lookup(req.Token)
+		if t == nil {
+			send(map[string]interface{}{"ok": false, "token": req.Token, "error": "not attached"})
+			return
+		}
+		mu.Lock()
+		if req.Cut != nil {
+			t.cut = *req.Cut != 0
+		}
+		if req.Radius != nil {
+			t.radius = *req.Radius
+		}
+		cut, radius := t.cut, t.radius
+		mu.Unlock()
+		ok, msg := applyRegion(t)
+		send(map[string]interface{}{"ok": ok, "token": req.Token, "cut": cut, "radius": radius, "region": msg})
+
+	case "drag":
+		t := lookup(req.Token)
+		if t == nil {
+			send(map[string]interface{}{"ok": false, "error": "not attached"})
+			return
+		}
+		go dragLoop(t, startLoop(t))
+		send(map[string]interface{}{"ok": true, "token": req.Token})
+
+	case "resize":
+		t := lookup(req.Token)
+		if t == nil {
+			send(map[string]interface{}{"ok": false, "error": "not attached"})
+			return
+		}
+		go resizeLoop(t, req.Aspect, startLoop(t))
+		send(map[string]interface{}{"ok": true, "token": req.Token, "aspect": req.Aspect})
+
+	case "status":
+		t := lookup(req.Token)
+		if t == nil {
+			send(map[string]interface{}{"ok": false, "error": "not attached"})
+			return
+		}
+		wr, _ := windowRect(t.hwnd)
+		cr, _ := clientRect(t.hwnd)
+		cur := call(procCreateRectRgn, 0, 0, 1, 1)
+		got := uintptr(0)
+		if cur != 0 {
+			got = call(procGetWindowRgn, t.hwnd, cur)
+			call(procDeleteObject, cur)
+		}
+		mu.Lock()
+		cut, radius, top := t.cut, t.radius, t.topmost
+		mu.Unlock()
+		send(map[string]interface{}{
+			"ok": true, "token": req.Token, "hwnd": fmt.Sprintf("0x%x", t.hwnd),
+			"alive": isAlive(t.hwnd), "topmost": top, "cut": cut, "radius": radius,
+			"regionSet": got >= 2, "regionType": got,
+			"window": []int32{wr.Left, wr.Top, wr.Right - wr.Left, wr.Bottom - wr.Top},
+			"client": []int32{cr.Right - cr.Left, cr.Bottom - cr.Top},
+		})
+
 	case "detach":
 		mu.Lock()
-		hwnd := tracked[req.Token]
-		delete(tracked, req.Token)
+		t := targets[req.Token]
+		delete(targets, req.Token)
 		mu.Unlock()
-		if hwnd == 0 {
-			hwnd = findWindow(req.Token)
-		}
-		ok := hwnd != 0 && applyTopmost(hwnd, false)
-		send(map[string]interface{}{"ok": ok, "token": req.Token})
+		clearWindow(t)
+		send(map[string]interface{}{"ok": true, "token": req.Token})
 
 	case "detachAll":
 		mu.Lock()
-		items := make([]string, 0, len(tracked))
-		for token, hwnd := range tracked {
-			applyTopmost(hwnd, false)
-			items = append(items, token)
-		}
-		tracked = map[string]uintptr{}
+		all := targets
+		targets = map[string]*target{}
 		mu.Unlock()
-		send(map[string]interface{}{"ok": true, "cleared": len(items)})
+		for _, t := range all {
+			clearWindow(t)
+		}
+		send(map[string]interface{}{"ok": true, "cleared": len(all)})
 
 	case "quit":
-		cleanup()
+		mu.Lock()
+		all := targets
+		targets = map[string]*target{}
+		mu.Unlock()
+		for _, t := range all {
+			clearWindow(t)
+		}
 		send(map[string]interface{}{"ok": true, "bye": true})
 		os.Exit(0)
 
@@ -218,19 +576,11 @@ func handle(req request) {
 	}
 }
 
-func cleanup() {
-	mu.Lock()
-	for token, hwnd := range tracked {
-		applyTopmost(hwnd, false)
-		delete(tracked, token)
-	}
-	mu.Unlock()
-}
-
 func main() {
-	// 注意：stdin EOF 时【故意】不还原置顶。
-	// MV3 的 service worker 空闲被回收时也会断开管道，若此时还原置顶，
-	// 用户会看到"窗口突然掉出置顶"。还原只走显式 detach / detachAll / quit。
+	// 必须先声明 DPI 感知，否则 GetWindowRect/SetWindowRgn 用虚拟坐标，裁剪会错位。
+	if call(procSetDpiCtx, dpiAwarenessPerMonitorV2) == 0 {
+		call(procSetDpiAware)
+	}
 
 	send(map[string]interface{}{"event": "ready", "ver": version, "pid": os.Getpid()})
 
@@ -238,6 +588,7 @@ func main() {
 	for {
 		var hdr [4]byte
 		if _, err := io.ReadFull(reader, hdr[:]); err != nil {
+			// EOF：刻意不还原置顶/区域（MV3 SW 被回收时会走到这里）
 			return
 		}
 		n := binary.LittleEndian.Uint32(hdr[:])

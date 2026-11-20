@@ -145,6 +145,7 @@
           codec,
           limit: rtp.qualityLimitationReason || '',
           srcW: mq.w, srcH: mq.h, srcFps: 0, srcDrop: 0, paused: mq.paused,
+          hidden: (typeof document !== 'undefined' && document.visibilityState !== 'visible') ? 1 : 0,
           jitterMs: dir === 'in' ? r2(n(rtp.jitter) * 1000) : 0,
           params: senderParams(pc),
         };
@@ -176,6 +177,7 @@
             s.limit ? '| limit=' + s.limit : '',
             s.srcDrop ? '| srcDrop=' + s.srcDrop : '',
             s.paused ? '| SRC-PAUSED' : '',
+            s.hidden ? '| TAB-HIDDEN' : '',
             s.params ? '| ' + s.params : ''
           );
         }
@@ -229,7 +231,7 @@
           '[mp-stats] === ' + key + ' (' + k.dir + ') ===\n' +
           '  samples=' + s.length +
           '  outAvg=' + k.w + 'x' + k.h + '@' + average(s, 'fps') + 'fps ' + average(s, 'kbps') + 'kbps ' + average(s, 'msPerFrame') + 'ms/f qp=' + average(s, 'qp') + '\n' +
-          '  srcAvg=' + k.srcW + 'x' + k.srcH + '@' + average(s, 'srcFps') + 'fps drop=' + average(s, 'srcDrop') + '\n' +
+          '  srcAvg=' + k.srcW + 'x' + k.srcH + '@' + average(s, 'srcFps') + 'fps drop=' + average(s, 'srcDrop') + ' hidden=' + (k.hidden ? 'yes' : 'no') + '\n' +
           '  encoder=' + (k.enc || '-') + '  codec=' + (k.codec || '-') + '  limit=' + (k.limit || '-') + '  params=' + (k.params || '-') + '\n' +
           '  verdict: ' + verdict(s)
         );
@@ -792,6 +794,45 @@
   /** 按「小窗实际显示尺寸 + 源分辨率 + 当前路数」配置编码器。
    *  目标：小窗里根本看不到的像素不去编，多开时逐级減负。
    *  targetW 为小窗显示宽度（CSS px），未知时按 1280 兜底；activeCount 为当前同时推送的路数。 */
+  /** 挂起/恢复某一路的编码：encodings[0].active=false 完全停止编码与发包，
+   *  不拆 PeerConnection，恢复是毫秒级（坞窗全屏独占某一路时，其余路零开销）。 */
+  function setRtcSenderActive(pc, active) {
+    if (!pc || typeof pc.getSenders !== 'function') return;
+    try {
+      const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+      if (!sender || typeof sender.getParameters !== 'function') return;
+      const params = sender.getParameters() || {};
+      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+      params.encodings[0].active = !!active;
+      const p = sender.setParameters(params);
+      if (p && p.catch) p.catch(() => {});
+      log('rtc sender', active ? 'resumed' : 'suspended');
+    } catch (e) {}
+  }
+
+  /** 向 background 取"所有标签页加起来"的并发路数；拿不到就退回本页计数。 */
+  async function globalStreamCount(fallback) {
+    try {
+      const r = await bgSend({ type: 'mp-active-count' });
+      if (r && typeof r.count === 'number' && r.count > 0) return r.count;
+    } catch (e) {}
+    return Math.max(1, fallback || 1);
+  }
+
+  /** 路数变化后把已建立的所有 WebRTC 发送端重新分档（新开一路会让旧路降档）。 */
+  async function retuneAllRtcSenders() {
+    const n = await globalStreamCount(1);
+    try {
+      companionConnections.forEach((conn) => {
+        if (conn && conn.pc) applyHighQualityRtcSenders(conn.pc, conn.video, conn.targetW, n);
+      });
+      rtcConnections.forEach((conn) => {
+        if (conn && conn.pc) applyHighQualityRtcSenders(conn.pc, conn.video, conn.targetW, n);
+      });
+    } catch (e) {}
+    return n;
+  }
+
   function applyHighQualityRtcSenders(pc, video, targetW, activeCount) {
     if (!pc || typeof pc.getSenders !== 'function') return;
     const count = Math.max(1, activeCount || 1);
@@ -975,6 +1016,7 @@
     }
     bgSend({ type: 'mp-companion-close', id });
     refreshStates();
+    retuneAllRtcSenders();
   }
 
   /* ------------------- Solo mode: 原生拆窗（零重编码置顶窗） ------------------- */
@@ -982,6 +1024,15 @@
   /** video -> { token, origTitle, bar } */
   const soloPopped = new Map();
   let soloActiveToken = '';
+
+  /** 裁边（SetWindowRgn 切掉 Chrome 工具栏）默认开启，可在工具条上一键关掉 */
+  const SOLO_CUT_KEY = NS + ':cut';
+  function soloCutPref() {
+    try { return localStorage.getItem(SOLO_CUT_KEY) !== '0'; } catch (e) { return true; }
+  }
+  function setSoloCutPref(on) {
+    try { localStorage.setItem(SOLO_CUT_KEY, on ? '1' : '0'); } catch (e) {}
+  }
 
   function soloWindowSize(video) {
     const availW = (typeof screen !== 'undefined' && screen.availWidth) || 1280;
@@ -1094,6 +1145,87 @@
     return node;
   }
 
+  /* 兜底隔离：把 <video> 直接搬进自建全屏舞台，并隐藏 body 下其它一切。
+   * 同文档内移动媒体元素是零拷贝的（不重新加载、不重编码），
+   * 用于容器探测失败的站点（视频被包在小盒子里、或用 shadow/特殊定位壳）。 */
+
+  const SOLO_ADOPT_KEY = NS + ':adopt:';
+  function soloAdoptPref() {
+    try {
+      return localStorage.getItem(SOLO_ADOPT_KEY + location.hostname) === '1';
+    } catch (e) { return false; }
+  }
+  function setSoloAdoptPref(on) {
+    try { localStorage.setItem(SOLO_ADOPT_KEY + location.hostname, on ? '1' : '0'); } catch (e) {}
+  }
+
+  /** 把 stage/video 的样式铺满（adopt 模式下每次 resize 只要重刷这个） */
+  function paintSoloStage(stage, video) {
+    if (stage) {
+      soloSet(stage, 'position', 'fixed');
+      soloSet(stage, 'top', '0');
+      soloSet(stage, 'left', '0');
+      soloSet(stage, 'right', '0');
+      soloSet(stage, 'bottom', '0');
+      soloSet(stage, 'width', '100vw');
+      soloSet(stage, 'height', '100vh');
+      soloSet(stage, 'margin', '0');
+      soloSet(stage, 'padding', '0');
+      soloSet(stage, 'background', '#000');
+      soloSet(stage, 'overflow', 'hidden');
+      soloSet(stage, 'z-index', '2147483600');
+      soloSet(stage, 'display', 'block');
+    }
+    if (video) {
+      soloSet(video, 'width', '100%');
+      soloSet(video, 'height', '100%');
+      soloSet(video, 'max-width', 'none');
+      soloSet(video, 'max-height', 'none');
+      soloSet(video, 'position', 'static');
+      soloSet(video, 'transform', 'none');
+      soloSet(video, 'object-fit', 'contain');
+      soloSet(video, 'background', '#000');
+      soloSet(video, 'z-index', 'auto');
+    }
+  }
+
+  function hideBodyExceptStage(stage) {
+    if (!document.body) return;
+    for (const child of Array.from(document.body.children)) {
+      if (child === stage) continue;
+      const sid = child.id || '';
+      if (sid.indexOf('__multipip__') === 0 || sid.indexOf('mp-solo') === 0) continue;
+      soloSet(child, 'display', 'none');
+    }
+    soloSet(document.documentElement, 'overflow', 'hidden');
+    soloSet(document.body, 'overflow', 'hidden');
+  }
+
+  /** 建舞台并把 video 搬进去；原位置用注释节点占位，召回时原样搬回。 */
+  function applySoloAdopt(video, rec) {
+    saveHome(video);
+    let stage = rec && rec.stage;
+    if (!stage || !stage.isConnected) {
+      stage = document.createElement('div');
+      stage.id = 'mp-solo-stage';
+      (document.documentElement || document.body).appendChild(stage);
+    }
+    try {
+      stage.appendChild(video);
+    } catch (e) {
+      log('solo adopt append failed', e);
+    }
+    paintSoloStage(stage, video);
+    hideBodyExceptStage(stage);
+    if (rec) {
+      rec.adopted = true;
+      rec.stage = stage;
+    }
+    log('solo adopt stage:', video.videoWidth + 'x' + video.videoHeight,
+      'children hidden =', document.body ? document.body.children.length : 0);
+    return stage;
+  }
+
   function applySoloIsolation(video) {
     const target = soloTargetNode(video);
     const hidden = soloFillViewport(target);
@@ -1181,11 +1313,56 @@
     const repave = mkBtn('重新铺满', '页面重排后画面不对时点一下，重新把视频铺满窗口');
     repave.onclick = () => { if (hooks && typeof hooks.repave === 'function') hooks.repave(); };
 
+    // 裁边后窗口没有边框可拖/可缩放，必须由宿主接管
+    const grip = document.createElement('span');
+    grip.textContent = '⣿';
+    grip.title = '按住拖动窗口';
+    grip.style.cssText = 'cursor:move;padding:4px 6px;border-radius:6px;background:rgba(255,255,255,.1);user-select:none;';
+    grip.addEventListener('mousedown', (ev) => {
+      ev.preventDefault();
+      bgSend({ type: 'mp-solo-drag', token });
+    });
+
+    const sizeGrip = document.createElement('span');
+    sizeGrip.textContent = '◢';
+    sizeGrip.title = '按住拖动等比缩放窗口';
+    sizeGrip.style.cssText = 'cursor:nwse-resize;padding:4px 6px;border-radius:6px;background:rgba(255,255,255,.1);user-select:none;';
+    sizeGrip.addEventListener('mousedown', (ev) => {
+      ev.preventDefault();
+      bgSend({ type: 'mp-solo-resize', token, aspect: hooks && hooks.aspect ? hooks.aspect() : 0 });
+    });
+
+    let cutOn = !!(hooks && hooks.cutPref);
+    const cut = mkBtn(cutOn ? '✂ 已裁边' : '✂ 裁边', '切换是否裁掉 Chrome 工具栏（真无边框）');
+    cut.onclick = () => {
+      const next = !cutOn;
+      bgSend({ type: 'mp-solo-setcut', token, cut: next }).then((r) => {
+        if (!r || !r.ok) { toast('裁边切换失败：' + ((r && r.error) || '宿主未连接'), 6000); return; }
+        cutOn = next;
+        setSoloCutPref(next);
+        cut.textContent = next ? '✂ 已裁边' : '✂ 裁边';
+      });
+    };
+
+    // 容器探测失败的站点：手动把 <video> 搬进全屏舞台（同文档零拷贝）
+    let adoptBtn = null;
+    if (hooks && typeof hooks.adopt === 'function' && !(hooks.adopted && hooks.adopted())) {
+      adoptBtn = mkBtn('⤓ 接管画面', '页面剩余内容遮不干净时点一下：把视频直接搬进全屏舞台（不重载、不编码）');
+      adoptBtn.onclick = () => {
+        hooks.adopt();
+        if (adoptBtn) { adoptBtn.remove(); adoptBtn = null; }
+      };
+    }
+
     const hint = document.createElement('span');
     hint.textContent = '\u539f\u751f\u62c6\u7a97 \u00b7 \u96f6\u91cd\u7f16\u7801';
     hint.style.cssText = 'color:#9aa4ad;font-size:11px;';
 
     bar.appendChild(hint);
+    if (adoptBtn) bar.appendChild(adoptBtn);
+    bar.appendChild(grip);
+    bar.appendChild(sizeGrip);
+    bar.appendChild(cut);
     bar.appendChild(repave);
     bar.appendChild(pin);
     bar.appendChild(recall);
@@ -1232,7 +1409,11 @@
     // 必须先把 token 写进标题：宿主是按窗口标题里的 token 认领 HWND 的
     try { document.title = token + ' \u00b7 ' + origTitle; } catch (e) {}
 
-    const resp = await bgSend({ type: 'mp-solo-open', token, width: size.width, height: size.height });
+    const cutPref = soloCutPref();
+    const resp = await bgSend({
+      type: 'mp-solo-open', token, width: size.width, height: size.height,
+      cut: cutPref, radius: 10,
+    });
     if (!resp || !resp.ok) {
       try { document.title = origTitle; } catch (e) {}
       toast('\u62c6\u7a97\u5931\u8d25\uff1a' + ((resp && resp.error) || '\u672a\u77e5\u539f\u56e0'), 6000);
@@ -1240,8 +1421,38 @@
     }
 
     soloActiveToken = token;
-    const target = applySoloIsolation(video);
-    const barHooks = { repave: null };
+    const rec = { token, origTitle, bar: null, titleObserver: null, reapply: null, adopted: false, stage: null };
+
+    // 先探测容器：若它明显不是"整屏播放器"（或该站点上次用过兜底），直接走 adopt
+    const probe = soloTargetNode(video);
+    const pr = probe.getBoundingClientRect();
+    const looksSmall = probe === video ||
+      pr.width < window.innerWidth * 0.55 ||
+      pr.height < window.innerHeight * 0.4;
+    let target;
+    if (looksSmall || soloAdoptPref()) {
+      target = applySoloAdopt(video, rec);
+      log('solo: adopt fallback (looksSmall=' + looksSmall + ')');
+    } else {
+      target = applySoloIsolation(video);
+    }
+
+    const barHooks = {
+      repave: null,
+      cutPref: cutPref,
+      adopt: () => {
+        soloRestoreAll();
+        applySoloAdopt(video, rec);
+        setSoloAdoptPref(true);
+        toast('已接管画面：本机该站点下次拆窗会直接走兜底模式', 3000);
+      },
+      adopted: () => !!rec.adopted,
+      aspect: () => {
+        if (video.videoWidth && video.videoHeight) return video.videoWidth / video.videoHeight;
+        if (window.innerHeight > 0) return window.innerWidth / window.innerHeight;
+        return 0;
+      },
+    };
     const bar = buildSoloBar(token, barHooks);
 
     // 部分站点会自己重写 document.title，持续把 token 顶在最前面（宿主靠它认领 HWND）
@@ -1262,7 +1473,12 @@
       if (!soloPopped.has(video)) return;
       try {
         soloRestoreAll();
-        if (video.isConnected) soloFillViewport(soloTargetNode(video));
+        if (rec.adopted) {
+          paintSoloStage(rec.stage, video);
+          hideBodyExceptStage(rec.stage);
+        } else if (video.isConnected) {
+          soloFillViewport(soloTargetNode(video));
+        }
         if (window.self !== window.top) {
           window.parent.postMessage({ __mpSolo: 'fill-frame' }, '*');
         }
@@ -1271,7 +1487,10 @@
     window.addEventListener('resize', reapply);
     barHooks.repave = reapply;
 
-    soloPopped.set(video, { token, origTitle, bar, titleObserver, reapply });
+    rec.bar = bar;
+    rec.titleObserver = titleObserver;
+    rec.reapply = reapply;
+    soloPopped.set(video, rec);
 
     // 页面自己的播放器可能会因尺寸突变暂停，兜底拉一次播放
     setTimeout(() => {
@@ -1284,6 +1503,7 @@
     }, 300);
 
     refreshStates();
+    retuneAllRtcSenders();
     log('solo window opened:', resp.winId, token, 'target:', target && target.tagName);
   }
 
@@ -1297,6 +1517,12 @@
       try {
         if (document.title.indexOf(rec.token) === 0) document.title = rec.origTitle;
       } catch (e) {}
+    }
+    if (video && rec && rec.adopted) {
+      try {
+        if (rec.stage) rec.stage.remove();
+        restoreVideo(video);   // 借助已有的 saveHome/restoreVideo 把元素搬回原位
+      } catch (e) { log('solo adopt restore failed', e); }
     }
     if (soloPopped.size === 0) {
       soloRestoreAll();
@@ -2333,6 +2559,11 @@
           c.video.pause();
         }
         c.slot.style.display = 'none';
+        // 隐藏的 WebRTC 卡片不要继续全速采集+编码
+        if (c.kind === 'rtc' && c.ctl && c.ctl.suspend) {
+          c.wasSuspended = true;
+          c.ctl.suspend(true);
+        }
       }
     });
   }
@@ -2350,6 +2581,10 @@
         c.wasPlaying = false;
         const p = c.video.play();
         if (p && p.catch) p.catch(() => {});
+      }
+      if (c.kind === 'rtc' && c.wasSuspended && c.ctl && c.ctl.suspend) {
+        c.wasSuspended = false;
+        c.ctl.suspend(false);
       }
     });
   }
@@ -2428,6 +2663,7 @@
         } catch (e) {}
         relay('volume', x);
       },
+      suspend: (on) => relay('suspend', !!on),
       paused: () => card.lastSync.paused,
       time: () => card.lastSync.currentTime,
       duration: () => card.lastSync.duration || (card.meta && card.meta.duration) || 0,
@@ -2595,6 +2831,69 @@
     v._mpAllowPause = false;
   }
 
+  /* ---------------- 源端"后台降帧"对策（默认关闭，可测量再开） ----------------
+   * 疑似链路：原视频被 muted=true + opacity:0 且标签页不可见时，Chrome 会把它当作
+   * "无声的后台视频"，把解码降到 1~5fps，captureStream 抓到幻灯片。
+   * 打开方式（视频页控制台执行后刷新页面）：
+   *   localStorage.setItem('__multipip__:audioKeepAlive','gain')  // WebAudio 零增益
+   *   localStorage.setItem('__multipip__:audioKeepAlive','tiny')  // 保留音量 0.001
+   *   localStorage.removeItem('__multipip__:audioKeepAlive')      // 关闭（默认）
+   * 风险：WebAudio 接管后，部分 DRM 站点或 captureStream 的音轨可能失效 —— 所以默认不开。
+   * 判断依据：mpStats 打印的 src 帧率（见 README「性能诊断」）。 */
+  const AUDIO_KEEPALIVE = (() => {
+    try { return (localStorage.getItem(NS + ':audioKeepAlive') || '').toLowerCase(); } catch (e) { return ''; }
+  })();
+  const silentAudio = new WeakMap();
+
+  function applySilentMute(video, silent) {
+    const mode = AUDIO_KEEPALIVE;
+    if (!mode) {
+      video.muted = silent;
+      return;
+    }
+    if (mode === 'tiny') {
+      video.muted = false;
+      if (silent) {
+        if (video._mpOrigVolume === undefined) video._mpOrigVolume = video.volume;
+        video.volume = 0.001;
+      } else if (video._mpOrigVolume !== undefined) {
+        video.volume = video._mpOrigVolume;
+        video._mpOrigVolume = undefined;
+      }
+      return;
+    }
+    let rec = silentAudio.get(video);
+    if (silent) {
+      if (rec) { try { rec.gain.gain.value = 0; } catch (e) {} return; }
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) { video.muted = true; return; }
+        const ctx = new AC();
+        const src = ctx.createMediaElementSource(video);
+        const gain = ctx.createGain();
+        gain.gain.value = 0;
+        src.connect(gain);
+        gain.connect(ctx.destination);
+        if (ctx.state === 'suspended') {
+          const pr = ctx.resume();
+          if (pr && pr.catch) pr.catch(() => {});
+        }
+        silentAudio.set(video, { ctx, src, gain });
+        video.muted = false;
+        log('audio keep-alive: zero-gain WebAudio mute');
+      } catch (e) {
+        log('audio keep-alive failed, fallback muted=true:', e && e.message);
+        video.muted = true;
+      }
+      return;
+    }
+    if (rec) {
+      try { rec.gain.gain.value = 1; } catch (e) {}
+      return;
+    }
+    video.muted = false;
+  }
+
   function hideCrossSourceVideo(video) {
     if (!video || video._mpCrossHidden) return;
     video._mpCrossHidden = true;
@@ -2602,7 +2901,7 @@
     video._mpOrigMuted = video.muted;
 
     // 1. 原页面自身静音，杜绝原页面和小窗双重声音
-    video.muted = true;
+    applySilentMute(video, true);
 
     // 2. 原视频画面透明（保留解码与 captureStream 捕获），避免原页面和小窗双重画面
     video.style.opacity = '0';
@@ -2658,7 +2957,10 @@
 
     if (video._mpOrigOpacity !== undefined) video.style.opacity = video._mpOrigOpacity;
     else video.style.opacity = '';
-    if (video._mpOrigMuted !== undefined) video.muted = video._mpOrigMuted;
+    if (video._mpOrigMuted !== undefined) {
+      if (AUDIO_KEEPALIVE) applySilentMute(video, false);
+      else video.muted = video._mpOrigMuted;
+    }
 
     if (video._mpCrossPh) {
       if (typeof video._mpCrossPh.remove === 'function') {
@@ -2763,8 +3065,9 @@
       }
     }, 400);
 
-    rtcConnections.set(connId, { pc, video, stream, syncTimer, dockOwnerId });
+    rtcConnections.set(connId, { pc, video, stream, syncTimer, dockOwnerId, targetW: 0 });
     mpStats.watch('dock-src#' + connId, pc, video, 'out');
+    retuneAllRtcSenders();
     dockCrossPopped.add(video);
     dockCrossIds.set(video, connId);
     protectSourceVideo(video);
@@ -4011,8 +4314,9 @@
             type: msg.answer.type,
             sdp: boostWebRtcVideoSdp(msg.answer.sdp),
           };
-          conn.pc.setRemoteDescription(new RTCSessionDescription(hqAnswer)).then(() => {
-            applyHighQualityRtcSenders(conn.pc, conn.video, conn.targetW, rtcConnections.size);
+          conn.pc.setRemoteDescription(new RTCSessionDescription(hqAnswer)).then(async () => {
+            const n = await globalStreamCount(rtcConnections.size);
+            applyHighQualityRtcSenders(conn.pc, conn.video, conn.targetW, n);
             log('WebRTC HQ connection established between tabs for connId:', msg.connId);
           }).catch((err) => {
             log('setRemoteDescription on answer failed:', err);
@@ -4106,6 +4410,11 @@
             if (!v.paused) playSourceVideo(v);
           }
           else if (msg.op === 'speed') { v.playbackRate = Number(msg.value) || 1; }
+          else if (msg.op === 'suspend') {
+            // 坞窗里该卡片被隐藏（例如另一张卡片全屏）时，停掉这一路的编码
+            const rc = msg.id != null ? rtcConnections.get(msg.id) : null;
+            if (rc && rc.pc) setRtcSenderActive(rc.pc, msg.value === false);
+          }
           else if (msg.op === 'volume') { const x = Number(msg.value); if (!isNaN(x)) { v.volume = Math.min(1, Math.max(0, x)); v.muted = x <= 0; } }
         }
       }
@@ -4131,8 +4440,9 @@
               type: data.answer.type,
               sdp: boostWebRtcVideoSdp(data.answer.sdp),
             };
-            conn.pc.setRemoteDescription(new RTCSessionDescription(hqAnswer)).then(() => {
-              applyHighQualityRtcSenders(conn.pc, conn.video, conn.targetW, companionPopped.size);
+            conn.pc.setRemoteDescription(new RTCSessionDescription(hqAnswer)).then(async () => {
+              const n = await globalStreamCount(companionPopped.size);
+              applyHighQualityRtcSenders(conn.pc, conn.video, conn.targetW, n);
               if (conn.iceCandidates && conn.iceCandidates.length) {
                 conn.iceCandidates.forEach((cand) => {
                   bgSend({

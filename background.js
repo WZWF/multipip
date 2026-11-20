@@ -44,6 +44,32 @@ const WIN_HOST_NAME = 'com.multipip.winhost';
 const companionWindows = new Map();
 let companionNextId = 1;
 
+/** 全局并发记账：source tab -> Set(connId)。用于按"所有标签页加起来的路数"分档，
+ *  而不是各标签页各自只看自己的 1 路。 */
+const activeSends = new Map();
+/** 'tabId:connId' -> true，坞窗里被隐藏（全屏独占别的卡片）而临时停编码的路 */
+const suspendedSends = new Set();
+
+function activeStreamCount() {
+  let n = companionWindows.size + soloWindows.size;
+  for (const conns of activeSends.values()) {
+    for (const connId of conns) {
+      if (!suspendedSends.has(connId)) n += 1;
+    }
+  }
+  return Math.max(1, n);
+}
+
+function trackSend(tabId, connId, on) {
+  if (connId == null) return;
+  if (!activeSends.has(tabId)) activeSends.set(tabId, new Set());
+  const set = activeSends.get(tabId);
+  if (on) set.add(connId);
+  else set.delete(connId);
+  if (on) suspendedSends.delete(connId);
+  if (!set.size) activeSends.delete(tabId);
+}
+
 /** solo（原生拆窗）窗口记账：winId -> { winId, tabId, token, originWinId, originIndex } */
 const soloWindows = new Map();
 /** solo token -> 同一条记录，宿主按 title 里的 token 找到 HWND */
@@ -150,6 +176,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // WebRTC signaling relay between source tab and dock owner tab
   if (msg.type === 'mp-rtc-offer') {
+    trackSend(tabId, msg.connId, true);
     const targetTab = (typeof msg.toTab === 'number') ? msg.toTab : dockOwnerTabId;
     if (targetTab != null) {
       chrome.tabs.sendMessage(targetTab, {
@@ -221,6 +248,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'mp-dock-ctl') {
+    if (msg.op === 'suspend' && msg.id != null) {
+      if (msg.value === false) suspendedSends.delete(msg.id);
+      else suspendedSends.add(msg.id);
+    }
     if (typeof msg.toTab === 'number') {
       chrome.tabs.sendMessage(msg.toTab, {
         type: 'mp-dock-ctl',
@@ -233,10 +264,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'mp-active-count') {
+    sendResponse({ ok: true, count: activeStreamCount() });
+    return true;
+  }
+
   if (msg.type === 'mp-dock-recall-card') {
     // toTab given -> the card's SOURCE tab (clean up its RTC source);
     // otherwise -> the dock owner (remove the card).
     const target = (typeof msg.toTab === 'number' && msg.toTab >= 0) ? msg.toTab : dockOwnerTabId;
+    if (typeof msg.toTab === 'number' && msg.toTab >= 0) trackSend(msg.toTab, msg.id, false);
     if (target != null) {
       chrome.tabs.sendMessage(target, { type: 'mp-dock-recall-card', id: msg.id }, () => { void chrome.runtime.lastError; });
     }
@@ -327,6 +364,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'mp-solo-drag') {
+    const ok = winHostPost({ cmd: 'drag', token: String(msg.token || '') });
+    sendResponse({ ok, error: ok ? '' : winHostLastError });
+    return true;
+  }
+
+  if (msg.type === 'mp-solo-resize') {
+    const ok = winHostPost({
+      cmd: 'resize',
+      token: String(msg.token || ''),
+      aspect: Number(msg.aspect) || 0,
+    });
+    sendResponse({ ok, error: ok ? '' : winHostLastError });
+    return true;
+  }
+
+  if (msg.type === 'mp-solo-setcut') {
+    const ok = winHostPost({
+      cmd: 'setcut',
+      token: String(msg.token || ''),
+      cut: msg.cut ? 1 : 0,
+      radius: Number(msg.radius) || 10,
+    });
+    sendResponse({ ok, error: ok ? '' : winHostLastError });
+    return true;
+  }
+
   if (msg.type === 'mp-solo-topmost') {
     const token = String(msg.token || '');
     const on = msg.on !== false;
@@ -383,8 +447,14 @@ function soloOpen(msg, sender) {
         soloByToken.set(token, rec);
         soloPersist();
         // 宿主按 title 里的 token 找窗口，窗口晚于消息出现也能自愈（宿主内部重试 3s）
-        winHostPost({ cmd: 'attach', token, topmost: 1 });
-        resolve({ ok: true, winId: win.id, topmost: true });
+        winHostPost({
+          cmd: 'attach',
+          token,
+          topmost: 1,
+          cut: msg.cut ? 1 : 0,
+          radius: Number(msg.radius) || 10,
+        });
+        resolve({ ok: true, winId: win.id, topmost: true, cut: !!msg.cut });
       });
     });
   });
@@ -489,6 +559,8 @@ function winHostConnect() {
         token: m.token,
         ok: !!m.ok,
         error: m.error || '',
+        cut: m.cut,
+        region: m.region || '',
       }, () => { void chrome.runtime.lastError; });
     }
   });
@@ -610,6 +682,11 @@ function notifyCompanionClosed(tabId, id) {
 chrome.tabs.onRemoved.addListener((tabId) => {
   owners.delete(tabId);
   tabVideos.delete(tabId);
+  const conns = activeSends.get(tabId);
+  if (conns) {
+    for (const connId of conns) suspendedSends.delete(connId);
+    activeSends.delete(tabId);
+  }
   if (dockOwnerTabId === tabId) dockOwnerTabId = null;
   if (lastVideoTabId === tabId) lastVideoTabId = null;
   const rec = soloByTabId(tabId);
