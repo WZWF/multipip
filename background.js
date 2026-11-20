@@ -470,10 +470,14 @@ function openSoloWindow(ctx) {
   const { tabId, token, originWinId, originIndex, originIncognito, msg, resolve } = ctx;
   const width = Math.max(240, Math.min(3000, Math.round(Number(msg.width) || 720)));
   const height = Math.max(140, Math.min(2000, Math.round(Number(msg.height) || 405)));
-  chrome.windows.create({ tabId, type: 'popup', width, height, focused: true }, (win) => {
-    if (chrome.runtime.lastError || !win) {
-      resolve({ ok: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'windows.create failed' });
-      return;
+  const baseOpts = { tabId, type: 'popup', width, height, focused: true };
+  // 无痕：默认让 Chrome 跟着 tabId 走；若它把窗口建到了另一个 profile（或直接报
+  // "Tabs can only be moved between Windows in the same profile"），再显式重试一次。
+  createSoloWindow(baseOpts, !!originIncognito, resolve, (win) => {
+    if (!!win.incognito !== !!originIncognito) {
+      console.warn('[Multi-PiP] solo profile mismatch', {
+        windowIncognito: !!win.incognito, originIncognito, winId: win.id, tabId,
+      });
     }
     const rec = { winId: win.id, tabId, token, originWinId, originIndex, incognito: originIncognito };
     soloWindows.set(win.id, rec);
@@ -488,6 +492,47 @@ function openSoloWindow(ctx) {
       radius: Number(msg.radius) || 10,
     });
     resolve({ ok: true, winId: win.id, topmost: true, cut: !!msg.cut });
+  });
+}
+
+/** 拆窗建窗：先按默认方式，失败且是无痕时显式带 incognito:true 重试。
+ *  无痕下 extensions 的 API 上下文若落在普通 profile，{tabId} 会被搬到错误 profile
+ *  的窗口，Chrome 直接报 "Tabs can only be moved between Windows in the same profile"。 */
+function createSoloWindow(opts, originIncognito, resolve, onWindow) {
+  const diag = (tag, extra) => {
+    console.warn('[Multi-PiP] solo create ' + tag, Object.assign({
+      incognitoContext: !!(chrome.extension && chrome.extension.inIncognitoContext),
+      originIncognito,
+    }, extra || {}));
+  };
+  chrome.windows.create(opts, (win) => {
+    const err = chrome.runtime.lastError;
+    if (!err && win) {
+      onWindow(win);
+      return;
+    }
+    const firstErr = (err && err.message) || 'windows.create failed';
+    diag('failed', { opts, error: firstErr });
+    if (!originIncognito) {
+      resolve({ ok: false, error: firstErr });
+      return;
+    }
+    const retry = Object.assign({}, opts, { incognito: true });
+    chrome.windows.create(retry, (win2) => {
+      const err2 = chrome.runtime.lastError;
+      if (!err2 && win2) {
+        diag('retried with incognito:true', { winId: win2.id });
+        onWindow(win2);
+        return;
+      }
+      const secondErr = (err2 && err2.message) || 'windows.create failed';
+      diag('retry failed', { opts: retry, error: secondErr });
+      resolve({
+        ok: false,
+        error: firstErr + ' / 重试：' + secondErr +
+          '（无痕窗口请确认扩展已勾选「在无痕模式下启用」）',
+      });
+    });
   });
 }
 
@@ -524,7 +569,9 @@ function soloRecall(rec) {
       moveTabBack(rec, fallback.id, -1);
     } else {
       // 一个普通窗口都没有：给它新开一个
-      chrome.windows.create({ tabId: rec.tabId, type: 'normal' }, (win) => {
+      const opts = { tabId: rec.tabId, type: 'normal' };
+      if (rec.incognito) opts.incognito = true;
+      chrome.windows.create(opts, (win) => {
         const err = chrome.runtime.lastError;
         if (err) {
           notifySoloError(rec.tabId, '召回失败：' + err.message);
@@ -546,7 +593,9 @@ function moveTabBack(rec, windowId, index) {
       return;
     }
     // 目标窗口不可用（profile 不匹配 / 已关闭 / 索引非法）：换一个新窗口收留它
-    chrome.windows.create({ tabId: rec.tabId, type: 'normal' }, () => {
+    const opts = { tabId: rec.tabId, type: 'normal' };
+    if (rec.incognito) opts.incognito = true;
+    chrome.windows.create(opts, () => {
       const err2 = chrome.runtime.lastError;
       if (err2) notifySoloError(rec.tabId, '召回失败：' + err2.message);
       else dropSoloPopup(rec, null);
