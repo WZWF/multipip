@@ -1,4 +1,4 @@
-# 多窗播放 Multi-PiP (v0.9)
+# 多窗播放 Multi-PiP (v0.10)
 
 一个面向 Chrome / Edge / Brave（Chromium 116+）的视频多窗与画中画增强扩展：支持将任意网页（B 站、YouTube、腾讯视频、爱奇艺、优酷、各类网课/公开课、直播等）的视频弹出为置顶窗口，提供**跨标签页多视频同窗合并（多视频坞）**与**无限多开的真·无边框置顶窗**。
 
@@ -10,13 +10,14 @@
    - 只要网页里有 `<video>` 元素，即可通过浏览器原生满帧捕获 + 本机内存级 WebRTC 回环通道（`iceServers: []` + `127.0.0.1` 直连，零外网请求、免疫防火墙/代理虚拟网卡 mDNS 拦截、延迟 < 30ms）将视频推送至跨标签页置顶坞或原生无边框窗。
    - **蓝光级原画质直通**：自动注入高码率 SDP（最高 `35Mbps`）并锁定 `1:1` 原始分辨率（`maintain-resolution`），60fps 高清画面零缩水；原页面保留原生音轨播放（无二次重编码失真、无双重声音），小窗控件实时反向控制原视频。
 
-2. **三种置顶模式 + 自动降级兜底**
+2. **五种置顶模式 + 自动降级兜底**
 
    | 模式 | 窗口形态 | 置顶 | 数量限制 | 适用场景 |
    | :--- | :--- | :---: | :---: | :--- |
    | **原生小窗**（`dock`） | 多视频置顶坞：无边框置顶窗，内置 5 种布局与独立卡片控件 | 是 | 全局 1 窗（可合并多个同页/跨标签页视频） | 多路比赛/直播同屏、边看网课边看资料 |
    | **原生画中画**（`native`） | 浏览器自带极简画中画窗 | 是 | 全局 1 窗 | 单视频极简置顶观看 |
    | **无边框窗**（`companion`） | 原生伴侣程序：无标题栏、无地址栏、支持一键全屏平铺与外挂字幕 | 是 | **无限制（可无限多开）** | 多窗口自由摆放、跨屏排布、挂载本地字幕 |
+   | **原生拆窗**（`solo`） | 把整个标签页挑进 Chrome popup 小窗，页面用 CSS 铺满，由常驻 Win32 宿主置顶 | 是 | **无限制（一窗一视频）** | **多开看直播/网课/监控，要求零画质损耗、零重编码、支持 DRM** |
    | **独立窗口**（`window`） | 浏览器 `window.open` 弹窗（当页面不支持 PiP 时自动兜底） | 否 | 不限（带地址栏） | HTTP 页面或受限环境自动降级 |
 
 3. **多视频坞（原生小窗）交互**
@@ -86,11 +87,15 @@ multipip/
 ├── background.js                 # Service Worker：坞归属管理 + WebRTC 信令/控制中继 + 伴侣进程桥接
 ├── popup.html                    # 浏览器工具栏图标弹窗说明
 ├── icons/                        # 16 / 48 / 128 PNG 扩展图标
-└── companion/                    # 无边框原生窗伴侣（免 Python、零配置修改）
-    ├── com.multipip.host.json    # 便携式原生消息宿主清单（相对路径 + 固定扩展 ID）
+├── host/winhost/                 # 原生拆窗置顶宿主源码（Go，约 200 行，单文件 exe 约 1.7MB）
+│   ├── main.go                   # Native Messaging 协议 + EnumWindows 认领窗口 + SetWindowPos 置顶
+│   └── build.bat                 # go build 到 companion/dist/multipip_winhost/
+└── companion/                    # 原生伴侣（免 Python、零配置修改）
+    ├── com.multipip.host.json    # 无边框窗宿主清单（WebView2 方案）
+    ├── com.multipip.winhost.json # 原生拆窗置顶宿主清单（Win32 方案）
     ├── register_host.bat         # 双击一键写入当前用户注册表（支持 Chrome / Edge / Brave / Chromium）
     ├── unregister_host.bat       # 双击一键清理注册表项
-    └── dist/multipip_host/       # 独立可执行程序目录（基于系统 WebView2）
+    └── dist/                     # multipip_host/（WebView2）+ multipip_winhost/（Win32 置顶）
 ```
 
 ---
@@ -100,15 +105,68 @@ multipip/
 - **低配置电脑（CPU 较弱、核显、8G 内存）怎么使用最省资源？**  
   - **首推「原生画中画」模式**：单视频弹出时，在面板切换为「原生画中画」或直接在视频右上角点击弹出。此模式直接调用 Windows 底层 Direct3D 硬件 Overlay 零拷贝图层，**CPU 占用率接近 0%，内存 0MB 额外占用，不发热不掉帧**。
   - **同页面多视频合并「原生小窗」**：同页视频直接采用 DOM 节点无损迁移，完全不需要额外编码，轻快省电。
-  - 最新版本已将跨标签页 WebRTC 回环从激进的 35Mbps 过饱和软编优化为 **核显友好的自适应高码率（2.5M~12Mbps）**，跟随视频原生帧率直推，大幅降低普通办公本的 CPU 与风扇负担。
+  - 最新版本已将跨标签页 WebRTC 回环从 35Mbps 过饱和软编改为：**用 `setCodecPreferences` 优先 H.264 硬编（Windows 核显 / NVENC / AMF）+ 编码分辨率对齐小窗实际显示尺寸 + 按路数分档限码限帧**，大幅降低普通办公本的 CPU 与风扇负担。
 - **某些网站（如嵌套在 iframe 播放器内）弹出报错 `only allow for a top-level browsing context`？**  
   已全面防御修复。W3C 规范禁止子 frame 直接调用 Document PiP，扩展会自动识别并在子框架内平滑降级至系统原生画中画，保证任何嵌入式视频都能秒弹成功且不再报错。
 - **为什么有的视频（如 Netflix）提示无法捕获画面流？**  
   受硬件级 DRM（Widevine L1 等）保护的加密流媒体在浏览器底层禁止 `captureStream()`，此时请改用浏览器自带的「原生画中画」模式。
 - **跨标签页合并或使用无边框窗时，原网页可以关掉吗？**  
   不能关闭源标签页（可以切换到后台或其他标签页）。画面流与音频由源标签页实时解码提供，扩展已自动阻止后台标签页被浏览器休眠暂停。
+- **「原生拆窗」模式和「无边框窗」有什么区别？**
+  - **原生拆窗**：把视频所在的**整个标签页**原样搬进一个置顶 popup 窗口，页面自己渲染，**零重编码、零拷贝、画质与帧率 100% 原生、支持 DRM**，多开 4 路等价于开 4 个普通标签页（各自硬件解码）。代价是标签页被搬走，不能同时在原页刷评论；顶部会保留 Chrome 的窄工具栏。
+  - **无边框窗**：`captureStream → 本地 WebRTC` 再编码到 WebView2，**没有边栏**、支持外挂字幕与多窗排版，但每路都有一次重编码（已优化为 H.264 硬编 + 对齐显示尺寸），且 DRM 视频无法捕获。
+  - 需要 **真·无边框** 或要挂字幕 → 用无边框窗；需要 **多开不卡 + 原画质 + DRM** → 用原生拆窗。
+- **原生拆窗需要装什么？** 复用同一套安装流程：双击 `companion/register_host.bat` 会同时注册两个宿主（`com.multipip.host` 与 `com.multipip.winhost`），然后在 `chrome://extensions/` 刷新扩展即可。若只需要置顶、不关心字幕，可以只用拆窗模式。
+- **原生拆窗的已知限制**：视频在跨域 `<iframe>` 里时只会铺满该 iframe（外层页面仍在）；点【大】或窗口放大后画面会按小窗尺寸的 CSS 铺满，属于浏览器原生缩放而非重编码。
 - **移动了项目文件夹位置后怎么办？**  
   如果移动了项目目录，请在浏览器 `chrome://extensions/` 中重新加载新路径，并重新双击一次 `companion/register_host.bat`。
+
+---
+
+## 性能诊断（WebRTC 遥测）
+
+多开卡顿时，先别改参数，先确认卡在哪一层。`content.js` 内置了一个默认关闭、关闭时零开销的诊断模块。
+
+**开启**（在视频所在页面的 DevTools 控制台执行，然后刷新页面）：
+
+```js
+localStorage.setItem('__multipip__:stats', '1');
+```
+
+**读取**（弹出小窗后，控制台每 2 秒打印一行，或手动汇总）：
+
+```js
+mpStats.report();          // 每个连接的均值 + 自动结论
+copy(mpStats.csv());       // 导出 CSV 贴到表格里对比改动前后
+mpStats.off();             // 关闭
+```
+
+> 上面三行需要把 DevTools 控制台左上角的上下文从 `top` 切到扩展（内容脚本）才能用。
+> 不想切上下文的话，在**默认控制台**里用事件桥接，效果一样：
+>
+> ```js
+> document.dispatchEvent(new CustomEvent('mp-stats', { detail: 'report' }));
+> document.dispatchEvent(new CustomEvent('mp-stats', { detail: 'csv' }));
+> copy(document.documentElement.dataset.mpStatsCsv);   // 导出 CSV
+> document.dispatchEvent(new CustomEvent('mp-stats', { detail: 'off' }));
+> ```
+
+打印内容示例：
+
+```
+[mp-stats] companion#3 OUT 1280x720@29.9 | src 1920x1080@29.9 | 3189kbps | 4ms/f | codec=H264 | MediaFoundation | limit=none | down=1.5 cap=2500k fps<25 framerate H264
+```
+
+**怎么看结论**：
+
+| 现象 | 含义 | 该改哪里 |
+| :--- | :--- | :--- |
+| `src` 帧率远低于源视频帧率（如 8fps） | 源端根本没吐帧，多半是后台标签页节能降帧 | 改静音策略 / 别用 WebRTC 走拆窗；调编码参数**无效** |
+| `src` 正常但 `OUT` 帧率只有一半 | 编码侧跟不上 | 降 `scaleResolutionDownBy`、限帧、优先硬编 H.264 |
+| `encoder` 是 `libvpx` / `libaom` / `openh264` | 走了 CPU 软编 | `setCodecPreferences` 优先 H.264（别手改 SDP） |
+| `ms/f` > 10（健康 < 6ms） | 编码器过载 | 降分辨率 / 降帧率 |
+| `limit=cpu` | 编码 CPU 饱和 | 同上 |
+| `IN` 侧帧率低但 `OUT` 正常 | 接收侧解码或渲染瓶颈 | 检查 WebView2 / 小窗渲染 |
 
 ---
 

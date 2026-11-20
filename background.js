@@ -37,9 +37,17 @@ let dockOwnerTabId = null;
 /** companion host name (must match companion/com.multipip.host.json) */
 const HOST_NAME = 'com.multipip.host';
 
+/** Win32 置顶宿主（must match companion/com.multipip.winhost.json） */
+const WIN_HOST_NAME = 'com.multipip.winhost';
+
 /** companion window id -> { port, url, openerTabId } */
 const companionWindows = new Map();
 let companionNextId = 1;
+
+/** solo（原生拆窗）窗口记账：winId -> { winId, tabId, token, originWinId, originIndex } */
+const soloWindows = new Map();
+/** solo token -> 同一条记录，宿主按 title 里的 token 找到 HWND */
+const soloByToken = new Map();
 
 /* ------------------------- core message handling ------------------------- */
 
@@ -299,8 +307,210 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  /* ------------------------------ solo 拆窗 ------------------------------ */
+
+  if (msg.type === 'mp-solo-open') {
+    soloOpen(msg, sender)
+      .then((resp) => sendResponse(resp))
+      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true;
+  }
+
+  if (msg.type === 'mp-solo-recall') {
+    const rec = (msg.token && soloByToken.get(String(msg.token))) || soloByTabId(tabId);
+    if (!rec) {
+      sendResponse({ ok: false, error: '\u5f53\u524d\u9875\u9762\u4e0d\u5728\u62c6\u7a97\u6a21\u5f0f\u4e0b' });
+      return true;
+    }
+    soloRecall(rec);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'mp-solo-topmost') {
+    const token = String(msg.token || '');
+    const on = msg.on !== false;
+    const posted = on
+      ? winHostPost({ cmd: 'attach', token, topmost: 1 })
+      : winHostPost({ cmd: 'detach', token });
+    sendResponse({ ok: posted, error: posted ? '' : winHostLastError });
+    return true;
+  }
+
+  if (msg.type === 'mp-win-ping') {
+    sendResponse({ ok: !!winHostConnect(), error: winHostLastError });
+    return true;
+  }
+
   return false;
 });
+
+/* --------------------- solo: Chrome popup 拆窗 + Win32 置顶 --------------------- */
+
+/**
+ * 把视频所在的 Tab 整体挪进一个 Chrome popup 窗口（同一个 WebContents，不重载、不掉进度、
+ * 不走任何编码），再由常驻 Win32 宿主把这个 HWND 置顶。
+ * 这是“多开 + 零重编码 + 支持 DRM”的唯一可靠路径。
+ */
+function soloOpen(msg, sender) {
+  return new Promise((resolve) => {
+    const tabId = sender.tab ? sender.tab.id : -1;
+    if (typeof tabId !== 'number' || tabId < 0) {
+      resolve({ ok: false, error: '\u65e0\u6cd5\u8bc6\u522b\u6765\u6e90\u6807\u7b7e\u9875' });
+      return;
+    }
+    const token = String(msg.token || '').slice(0, 64);
+    if (!token) {
+      resolve({ ok: false, error: '\u7f3a\u5c11 token' });
+      return;
+    }
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) {
+        resolve({ ok: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'tab gone' });
+        return;
+      }
+      const originWinId = tab.windowId;
+      const originIndex = tab.index;
+      const width = Math.max(240, Math.min(3000, Math.round(Number(msg.width) || 720)));
+      const height = Math.max(140, Math.min(2000, Math.round(Number(msg.height) || 405)));
+      chrome.windows.create({ tabId, type: 'popup', width, height, focused: true }, (win) => {
+        if (chrome.runtime.lastError || !win) {
+          resolve({ ok: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'windows.create failed' });
+          return;
+        }
+        const rec = { winId: win.id, tabId, token, originWinId, originIndex };
+        soloWindows.set(win.id, rec);
+        soloByToken.set(token, rec);
+        soloPersist();
+        // 宿主按 title 里的 token 找窗口，窗口晚于消息出现也能自愈（宿主内部重试 3s）
+        winHostPost({ cmd: 'attach', token, topmost: 1 });
+        resolve({ ok: true, winId: win.id, topmost: true });
+      });
+    });
+  });
+}
+
+function soloByTabId(tabId) {
+  for (const rec of soloWindows.values()) {
+    if (rec.tabId === tabId) return rec;
+  }
+  return null;
+}
+
+/** 召回：先让页面撤销 CSS 隔离，再把 Tab 原路移回、销毁空的 popup 窗口、取消置顶。 */
+function soloRecall(rec) {
+  if (!rec) return;
+  soloWindows.delete(rec.winId);
+  soloByToken.delete(rec.token);
+  soloPersist();
+  winHostPost({ cmd: 'detach', token: rec.token });
+  try {
+    chrome.tabs.sendMessage(rec.tabId, { type: 'mp-solo-restore', token: rec.token }, () => { void chrome.runtime.lastError; });
+  } catch (e) { /* tab gone */ }
+  chrome.tabs.move(rec.tabId, { windowId: rec.originWinId, index: rec.originIndex }, () => {
+    if (chrome.runtime.lastError) return;
+    chrome.windows.remove(rec.winId, () => { void chrome.runtime.lastError; });
+  });
+}
+
+chrome.windows.onRemoved.addListener((winId) => {
+  const rec = soloWindows.get(winId);
+  if (!rec) return;
+  soloWindows.delete(winId);
+  soloByToken.delete(rec.token);
+  soloPersist();
+  winHostPost({ cmd: 'detach', token: rec.token });
+  if (rec.tabId != null) {
+    chrome.tabs.sendMessage(rec.tabId, { type: 'mp-solo-restore', token: rec.token }, () => { void chrome.runtime.lastError; });
+  }
+});
+
+/* ------------------------ Win32 host (single instance) ------------------------ */
+
+let winPort = null;
+let winHostLastError = '';
+let winHeartbeat = null;
+
+/** MV3 service worker 空闲会被回收（连带断开宿主管道）。心跳能显著延长存活，
+ *  即使被回收也不影响置顶：宿主在 EOF 时刻意不还原置顶，恢复后再幂等重发 attach。 */
+function winHeartbeatStart() {
+  if (winHeartbeat) return;
+  winHeartbeat = setInterval(() => {
+    if (soloByToken.size === 0) return;
+    winHostPost({ cmd: 'ping' });
+  }, 20000);
+}
+
+/** solo 状态落盘到 storage.session，SW 重启后据此恢复置顶。 */
+function soloPersist() {
+  try {
+    const list = Array.from(soloWindows.values());
+    chrome.storage.session.set({ multipip_solo: list }, () => { void chrome.runtime.lastError; });
+  } catch (e) { /* storage.session unavailable */ }
+}
+
+function soloRestoreOnBoot() {
+  try {
+    chrome.storage.session.get(['multipip_solo'], (res) => {
+      if (chrome.runtime.lastError) return;
+      const list = (res && res.multipip_solo) || [];
+      for (const rec of list) {
+        if (!rec || !rec.token || rec.winId == null) continue;
+        if (soloWindows.has(rec.winId)) continue;
+        soloWindows.set(rec.winId, rec);
+        soloByToken.set(rec.token, rec);
+        winHostPost({ cmd: 'attach', token: rec.token, topmost: 1 });
+      }
+    });
+  } catch (e) { /* ignore */ }
+}
+soloRestoreOnBoot();
+
+/** 全局只保持一条长连接：与 companion 每窗一个进程不同，这里只做置顶，不需要进程隔离。 */
+function winHostConnect() {
+  if (winPort) return winPort;
+  try {
+    winPort = chrome.runtime.connectNative(WIN_HOST_NAME);
+  } catch (e) {
+    winPort = null;
+    winHostLastError = String((e && e.message) || e);
+    return null;
+  }
+  winHostLastError = '';
+  winHeartbeatStart();
+  winPort.onMessage.addListener((m) => {
+    if (!m) return;
+    if (m.event === 'ready') return;
+    if (!m.token) return;
+    const rec = soloByToken.get(m.token);
+    if (rec && rec.tabId != null) {
+      chrome.tabs.sendMessage(rec.tabId, {
+        type: 'mp-solo-topmost-state',
+        token: m.token,
+        ok: !!m.ok,
+        error: m.error || '',
+      }, () => { void chrome.runtime.lastError; });
+    }
+  });
+  winPort.onDisconnect.addListener(() => {
+    winHostLastError = (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'disconnected';
+    winPort = null;
+  });
+  return winPort;
+}
+
+function winHostPost(msg) {
+  const port = winHostConnect();
+  if (!port) return false;
+  try {
+    port.postMessage(msg);
+    return true;
+  } catch (e) {
+    winPort = null;
+    winHostLastError = String((e && e.message) || e);
+    return false;
+  }
+}
 
 /* ------------------------- companion (native host) ------------------------- */
 
@@ -402,6 +612,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   tabVideos.delete(tabId);
   if (dockOwnerTabId === tabId) dockOwnerTabId = null;
   if (lastVideoTabId === tabId) lastVideoTabId = null;
+  const rec = soloByTabId(tabId);
+  if (rec) {
+    soloWindows.delete(rec.winId);
+    soloByToken.delete(rec.token);
+    soloPersist();
+    winHostPost({ cmd: 'detach', token: rec.token });
+  }
 });
 
 /** Alt+Shift+S: cycle playback speed of the current video */

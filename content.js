@@ -40,6 +40,252 @@
     return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
   }
 
+  /* ------------- Phase 0: WebRTC performance telemetry (diagnostics) -------------
+   * 只读诊断：关闭时零开销（不建定时器、不调 getStats）。
+   *
+   * 打开（任选其一）：
+   *   1) 视频页面的 DevTools 控制台执行 localStorage.setItem('__multipip__:stats','1') 后刷新页面；
+   *   2) 把 DevTools 控制台上下文切到 content script，执行 mpStats.on()。
+   * 关闭：localStorage.removeItem('__multipip__:stats') 后刷新，或 mpStats.off()。
+   * 汇总：mpStats.report()        导出可粘贴到表格的 CSV：mpStats.csv()
+   * --------------------------------------------------------------------------- */
+  const mpStats = (() => {
+    const KEY = NS + ':stats';
+    const INTERVAL = 2000;
+    const MAX_SAMPLES = 400;
+    const watched = new Map();
+    let enabled = false;
+    let pulse = null;
+    try { enabled = localStorage.getItem(KEY) === '1'; } catch (e) {}
+
+    const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    const r1 = (v) => Math.round(v * 10) / 10;
+    const r2 = (v) => Math.round(v * 100) / 100;
+
+    function mediaQuality(media) {
+      const out = { w: 0, h: 0, frames: 0, drop: 0, paused: true };
+      if (!media) return out;
+      try {
+        out.w = n(media.videoWidth);
+        out.h = n(media.videoHeight);
+        out.paused = !!media.paused;
+        const q = media.getVideoPlaybackQuality ? media.getVideoPlaybackQuality() : null;
+        if (q) { out.frames = n(q.totalVideoFrames); out.drop = n(q.droppedVideoFrames); }
+      } catch (e) {}
+      if (!out.frames && media.webkitDecodedFrameCount) out.frames = n(media.webkitDecodedFrameCount);
+      return out;
+    }
+
+    function pickRtp(reports, dir) {
+      const type = dir === 'in' ? 'inbound-rtp' : 'outbound-rtp';
+      let best = null;
+      reports.forEach((r) => {
+        if (!r || r.type !== type) return;
+        if (r.kind !== 'video' && r.mediaType !== 'video') return;
+        if (!best) best = r;
+      });
+      return best;
+    }
+
+    /** 当前 sender 的有效参数，用来确认「改了参数到底生效没有」 */
+    function senderParams(pc) {
+      try {
+        const sender = (pc.getSenders() || []).find((s) => s.track && s.track.kind === 'video');
+        if (!sender || typeof sender.getParameters !== 'function') return '';
+        const p = sender.getParameters() || {};
+        const e = (p.encodings && p.encodings[0]) || {};
+        const parts = [];
+        if (e.scaleResolutionDownBy != null) parts.push('down=' + r2(e.scaleResolutionDownBy));
+        if (e.maxBitrate != null) parts.push('cap=' + Math.round(e.maxBitrate / 1000) + 'k');
+        if (e.maxFramerate != null) parts.push('fps<' + e.maxFramerate);
+        if (p.degradationPreference) parts.push(String(p.degradationPreference).replace('maintain-', ''));
+        const codecs = (p.codecs || []).map((c) => String(c.mimeType || '').replace('video/', '')).filter(Boolean);
+        if (codecs.length) parts.push(codecs.join('+'));
+        return parts.join(' ');
+      } catch (e) { return ''; }
+    }
+
+    function startPulse() {
+      if (pulse || !enabled) return;
+      pulse = setInterval(() => { watched.forEach((_, key) => take(key)); }, INTERVAL);
+    }
+    function stopPulseIfIdle() {
+      if (!pulse || watched.size) return;
+      clearInterval(pulse);
+      pulse = null;
+    }
+
+    function take(key) {
+      const entry = watched.get(key);
+      if (!entry) return;
+      const { pc, media, dir } = entry;
+      if (!pc || pc.connectionState === 'closed') { unwatch(key); return; }
+      pc.getStats().then((reports) => {
+        const rtp = pickRtp(reports, dir);
+        if (!rtp) return;
+        const now = performance.now();
+        const prev = entry.prev;
+        const dt = prev ? (now - prev.t) / 1000 : 0;
+        const mq = mediaQuality(media);
+        const bytes = dir === 'in' ? n(rtp.bytesReceived) : n(rtp.bytesSent);
+        const frames = dir === 'in' ? n(rtp.framesDecoded) : n(rtp.framesEncoded);
+        const spent = dir === 'in' ? n(rtp.totalDecodeTime) : n(rtp.totalEncodeTime);
+        const qpSum = n(rtp.qpSum);
+        let codec = '';
+        try {
+          const c = rtp.codecId ? reports.get(rtp.codecId) : null;
+          if (c && c.mimeType) codec = String(c.mimeType).replace('video/', '');
+        } catch (e) {}
+        const s = {
+          t: new Date().toISOString().slice(11, 19),
+          key, dir,
+          w: n(rtp.frameWidth), h: n(rtp.frameHeight),
+          fps: 0, kbps: 0, msPerFrame: 0, qp: 0,
+          enc: rtp.encoderImplementation || rtp.decoderImplementation || '',
+          codec,
+          limit: rtp.qualityLimitationReason || '',
+          srcW: mq.w, srcH: mq.h, srcFps: 0, srcDrop: 0, paused: mq.paused,
+          jitterMs: dir === 'in' ? r2(n(rtp.jitter) * 1000) : 0,
+          params: senderParams(pc),
+        };
+        if (prev && dt > 0.2) {
+          const dFrames = frames - prev.frames;
+          const dBytes = bytes - prev.bytes;
+          const dSpent = spent - prev.spent;
+          s.fps = r1(dFrames / dt);
+          s.kbps = Math.round((dBytes * 8) / dt / 1000);
+          s.msPerFrame = dFrames > 0 ? r2((dSpent / dFrames) * 1000) : 0;
+          s.qp = dFrames > 0 ? Math.round((qpSum - prev.qpSum) / dFrames) : 0;
+          s.srcFps = r1((mq.frames - prev.srcFrames) / dt);
+          s.srcDrop = mq.drop - prev.srcDrop;
+        }
+        entry.prev = { t: now, bytes, frames, spent, qpSum, srcFrames: mq.frames, srcDrop: mq.drop };
+        entry.samples.push(s);
+        if (entry.samples.length > MAX_SAMPLES) entry.samples.shift();
+        if (prev && dt > 0.2) {
+          const tag = s.dir === 'in' ? 'IN ' : 'OUT';
+          log(
+            '[mp-stats]', key, tag,
+            s.w + 'x' + s.h + '@' + s.fps,
+            '| src', s.srcW + 'x' + s.srcH + '@' + s.srcFps,
+            '| ' + s.kbps + 'kbps',
+            '| ' + s.msPerFrame + 'ms/f',
+            s.qp ? '| qp=' + s.qp : '',
+            s.codec ? '| codec=' + s.codec : '',
+            s.enc ? '| ' + s.enc : '',
+            s.limit ? '| limit=' + s.limit : '',
+            s.srcDrop ? '| srcDrop=' + s.srcDrop : '',
+            s.paused ? '| SRC-PAUSED' : '',
+            s.params ? '| ' + s.params : ''
+          );
+        }
+      }).catch(() => {});
+    }
+
+    function watch(key, pc, media, dir) {
+      if (!enabled || !pc) return;
+      if (watched.has(key)) unwatch(key);
+      watched.set(key, { pc, media, dir: dir || 'out', prev: null, samples: [] });
+      log('[mp-stats] start watching', key, dir || 'out');
+      startPulse();
+    }
+
+    function unwatch(key) {
+      watched.delete(key);
+      stopPulseIfIdle();
+    }
+
+    function average(samples, field) {
+      const vals = samples.map((s) => s[field]).filter((v) => typeof v === 'number' && v > 0);
+      if (!vals.length) return 0;
+      return r1(vals.reduce((a, b) => a + b, 0) / vals.length);
+    }
+
+    /** 每个连接给一句结论，免得只会看数字的人误判方向 */
+    function verdict(samples) {
+      if (!samples.length) return 'no samples';
+      const k = samples[samples.length - 1];
+      const srcFps = average(samples, 'srcFps');
+      const outFps = average(samples, 'fps');
+      const ms = average(samples, 'msPerFrame');
+      const soft = /libvpx|libaom|openh264|ffmpeg/i.test(k.enc || '');
+      const tally = [];
+      if (k.dir === 'out' && srcFps > 0 && srcFps < 20) tally.push('源端只吐 ' + srcFps + 'fps -> 后台节流/源视频本身低帧，改 WebRTC 参数无用');
+      if (k.dir === 'out' && srcFps >= 20 && outFps < srcFps * 0.7) tally.push('采集 ' + srcFps + 'fps 但只编码出 ' + outFps + 'fps -> 编码侧跟不上（降分辨率/限帧/换硬编）');
+      if (!k.dir || k.dir === 'out') { if (soft) tally.push('编码器 ' + k.enc + ' 是软编 -> setCodecPreferences 优先 H.264 收益最大'); }
+      if (ms >= 10) tally.push('单帧 ' + ms + 'ms（健康 <6ms）-> 编码器过载');
+      if (/cpu/i.test(k.limit || '')) tally.push('qualityLimitation=cpu');
+      if (k.dir === 'in' && outFps > 0 && outFps < 20) tally.push('接收侧只显示 ' + outFps + 'fps -> 解码/合成瓶颈或渲染被节流');
+      return tally.length ? tally.join(' / ') : 'ok（未发现明显瓶颈）';
+    }
+
+    function report() {
+      if (!watched.size) { log('[mp-stats] 没有任何被监听的连接'); return; }
+      watched.forEach((entry, key) => {
+        const s = entry.samples;
+        if (!s.length) { log('[mp-stats]', key, 'no samples yet'); return; }
+        const k = s[s.length - 1];
+        console.log(
+          '[mp-stats] === ' + key + ' (' + k.dir + ') ===\n' +
+          '  samples=' + s.length +
+          '  outAvg=' + k.w + 'x' + k.h + '@' + average(s, 'fps') + 'fps ' + average(s, 'kbps') + 'kbps ' + average(s, 'msPerFrame') + 'ms/f qp=' + average(s, 'qp') + '\n' +
+          '  srcAvg=' + k.srcW + 'x' + k.srcH + '@' + average(s, 'srcFps') + 'fps drop=' + average(s, 'srcDrop') + '\n' +
+          '  encoder=' + (k.enc || '-') + '  codec=' + (k.codec || '-') + '  limit=' + (k.limit || '-') + '  params=' + (k.params || '-') + '\n' +
+          '  verdict: ' + verdict(s)
+        );
+      });
+    }
+
+    function csv() {
+      const head = 'time,key,dir,outW,outH,outFps,kbps,msPerFrame,qp,codec,encoder,limit,srcW,srcH,srcFps,srcDrop,paused,params';
+      const rows = [head];
+      watched.forEach((entry, key) => {
+        entry.samples.forEach((s) => {
+          rows.push([s.t, key, s.dir, s.w, s.h, s.fps, s.kbps, s.msPerFrame, s.qp, s.codec, s.enc, s.limit, s.srcW, s.srcH, s.srcFps, s.srcDrop, s.paused ? 1 : 0, '"' + (s.params || '') + '"'].join(','));
+        });
+      });
+      return rows.join('\n');
+    }
+
+    function setEnabled(v) {
+      enabled = !!v;
+      try {
+        if (enabled) localStorage.setItem(KEY, '1');
+        else localStorage.removeItem(KEY);
+      } catch (e) {}
+      if (enabled) { startPulse(); log('[mp-stats] enabled'); }
+      else { if (pulse) { clearInterval(pulse); pulse = null; } watched.clear(); log('[mp-stats] disabled'); }
+    }
+
+    return {
+      watch, unwatch, report, csv,
+      on: () => setEnabled(true),
+      off: () => setEnabled(false),
+      get enabled() { return enabled; },
+      get size() { return watched.size; },
+      __take: take,
+    };
+  })();
+  try { window.mpStats = mpStats; } catch (e) {}
+
+  /* 页面世界桥接：不用把 DevTools 控制台切到扩展上下文，也能在默认 console 里驱动遥测。
+   *   document.dispatchEvent(new CustomEvent('mp-stats', { detail: 'report' }))
+   *   document.dispatchEvent(new CustomEvent('mp-stats', { detail: 'csv' }))
+   *   copy(document.documentElement.dataset.mpStatsCsv) */
+  try {
+    document.addEventListener('mp-stats', (ev) => {
+      const cmd = String((ev && ev.detail) || 'report');
+      if (cmd === 'on') mpStats.on();
+      else if (cmd === 'off') mpStats.off();
+      else if (cmd === 'report') mpStats.report();
+      else if (cmd === 'csv') {
+        const text = mpStats.csv();
+        try { document.documentElement.setAttribute('data-mp-stats-csv', text); } catch (e) {}
+        log('[mp-stats] CSV 已写入 document.documentElement.dataset.mpStatsCsv（' + text.length + ' 字符），复制：copy(document.documentElement.dataset.mpStatsCsv)');
+      }
+    }, false);
+  } catch (e) {}
+
   /* ------------------------------- settings ------------------------------- */
   let currentMode = 'dock';
   try {
@@ -399,6 +645,10 @@
         popOutOwnWindow(video);
         return;
       }
+      if (mode === 'solo') {
+        await popOutSolo(video);
+        return;
+      }
 
       // Default: Dock mode (原生多视频坞)
       await popOutToDock(video);
@@ -458,13 +708,13 @@
     const lines = sdp.split('\r\n');
     const out = [];
     let inVideo = false;
-    const videoPts = new Set();
+    const videoPts = new Map();
     const hasFmtp = new Set();
     for (const line of lines) {
       if (line.indexOf('m=') === 0) inVideo = line.indexOf('m=video') === 0;
       if (inVideo) {
         const m = line.match(/^a=rtpmap:(\d+)\s+(VP9|VP8|H264|AV1)\/90000/i);
-        if (m) videoPts.add(m[1]);
+        if (m) videoPts.set(m[1], m[2].toUpperCase());
       }
     }
     for (const line of lines) {
@@ -473,7 +723,8 @@
     }
     inVideo = false;
     // 兼顾 1080p 纯净画质与普通核显性能：起步 2Mbps，上限 6Mbps（开 4 个总码率仅约 16Mbps，不冲垮总线与 CPU）
-    const br = 'x-google-min-bitrate=1500;x-google-start-bitrate=3500;x-google-max-bitrate=6000';
+    // 最小码率不能写高：静止画面/小窗会逼编码器空吐比特，这里交给 setParameters 动态控制
+    const br = 'x-google-min-bitrate=300;x-google-start-bitrate=1200;x-google-max-bitrate=6000';
     for (const line of lines) {
       if (line.indexOf('m=') === 0) inVideo = line.indexOf('m=video') === 0;
       if (inVideo && line.indexOf('c=IN ') === 0) {
@@ -482,7 +733,7 @@
         continue;
       }
       const fm = line.match(/^a=fmtp:(\d+)\s+(.*)$/);
-      if (inVideo && fm && videoPts.has(fm[1])) {
+      if (inVideo && fm && videoPts.has(fm[1]) && videoPts.get(fm[1]) !== 'H264') {
         if (fm[2].indexOf('x-google-max-bitrate') < 0) {
           out.push('a=fmtp:' + fm[1] + ' ' + fm[2] + ';' + br);
         } else {
@@ -492,37 +743,93 @@
       }
       out.push(line);
       const rm = line.match(/^a=rtpmap:(\d+)\s+/);
-      if (inVideo && rm && videoPts.has(rm[1]) && !hasFmtp.has(rm[1])) {
+      if (inVideo && rm && videoPts.has(rm[1]) && videoPts.get(rm[1]) !== 'H264' && !hasFmtp.has(rm[1])) {
         out.push('a=fmtp:' + rm[1] + ' ' + br);
       }
     }
     return out.join('\r\n');
   }
 
-  function applyHighQualityRtcSenders(pc) {
+  /** 用标准 API 把硬编覆盖率最高的 H.264 排到最前。
+   *  必须用 `setCodecPreferences`，不要再手改 SDP 字符串（1c5fb7c 就是那样把 offer/answer 协商弄坏才回退的）。
+   *  未做任何过滤的默认情况下 Chromium 本地回环会落到 VP8（libvpx 纯 CPU 软编），这是多开卡的主因之一。 */
+  function preferHardwareH264(pc) {
+    try {
+      if (!pc || typeof pc.getTransceivers !== 'function') return;
+      const caps = (typeof RTCRtpSender !== 'undefined' && RTCRtpSender.getCapabilities)
+        ? RTCRtpSender.getCapabilities('video') : null;
+      if (!caps || !caps.codecs || !caps.codecs.length) return;
+
+      const all = caps.codecs.slice();
+      const rank = (c) => {
+        const mime = String(c.mimeType || '').toLowerCase();
+        if (mime !== 'video/h264') return null;
+        const fmtp = String(c.sdpFmtpLine || '').toLowerCase();
+        const plid = (fmtp.match(/profile-level-id=([0-9a-f]{6})/) || [])[1] || '';
+        const profile = plid.slice(0, 4);
+        // 42e0=Constrained Baseline / 4d00=Main / 6400=High，Windows 核显 QSV、NVENC、AMF 三者均覆盖
+        const base = profile === '42e0' ? 0 : profile === '4d00' ? 10 : 20;
+        return base + (fmtp.indexOf('level-asymmetry-allowed=1') >= 0 ? 0 : 1);
+      };
+      const h264 = all.filter((c) => rank(c) != null).sort((a, b) => rank(a) - rank(b));
+      if (!h264.length) return;
+      const chosen = new Set(h264);
+      const ordered = h264.concat(all.filter((c) => !chosen.has(c)));
+
+      pc.getTransceivers().forEach((t) => {
+        try {
+          if (typeof t.setCodecPreferences !== 'function') return;
+          if (!t.sender || !t.sender.track || t.sender.track.kind !== 'video') return;
+          t.setCodecPreferences(ordered);
+        } catch (e) { log('setCodecPreferences failed:', e && e.message); }
+      });
+      log('codec preference: H.264 first (' + h264.length + ' h264 profiles ordered)');
+    } catch (e) { log('preferHardwareH264 error:', e && e.message); }
+  }
+
+  const r2s = (v) => Math.round(v * 100) / 100;
+
+  /** 按「小窗实际显示尺寸 + 源分辨率 + 当前路数」配置编码器。
+   *  目标：小窗里根本看不到的像素不去编，多开时逐级減负。
+   *  targetW 为小窗显示宽度（CSS px），未知时按 1280 兜底；activeCount 为当前同时推送的路数。 */
+  function applyHighQualityRtcSenders(pc, video, targetW, activeCount) {
     if (!pc || typeof pc.getSenders !== 'function') return;
+    const count = Math.max(1, activeCount || 1);
+    const srcW = (video && video.videoWidth) || 0;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let capW = targetW ? Math.round(targetW * dpr) : 1280;
+    capW = Math.max(640, Math.min(capW, srcW || 1920, 1920));
+    if (count >= 3) capW = Math.min(capW, 960);
+
+    const tier = count >= 3 ? { maxBitrate: 2500000, maxFramerate: 25 }
+      : count === 2 ? { maxBitrate: 4000000, maxFramerate: 30 }
+        : { maxBitrate: 6000000, maxFramerate: 30 };
+
     pc.getSenders().forEach((sender) => {
       try {
-        if (sender.track && sender.track.kind === 'video' && typeof sender.getParameters === 'function') {
-          const params = sender.getParameters() || {};
-          params.degradationPreference = 'maintain-resolution';
-          if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-          // 最大码率 6Mbps，帧率上限 30fps，低配电脑多开零压力
-          params.encodings[0].maxBitrate = 6000000;
-          params.encodings[0].maxFramerate = 30;
-          params.encodings[0].scaleResolutionDownBy = 1.0;
-          const p = sender.setParameters(params);
-          if (p && p.catch) p.catch(() => {});
-        }
+        if (!sender.track || sender.track.kind !== 'video' || typeof sender.getParameters !== 'function') return;
+        const params = sender.getParameters() || {};
+        if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+        const enc = params.encodings[0];
+        enc.scaleResolutionDownBy = (srcW && srcW > capW) ? Math.min(16, srcW / capW) : 1;
+        enc.maxBitrate = tier.maxBitrate;
+        enc.maxFramerate = tier.maxFramerate;
+        // 卡顿时优先降分辨率保流畅（而不是死保分辨率、狂掉帧）
+        params.degradationPreference = 'maintain-framerate';
+        const p = sender.setParameters(params);
+        if (p && p.catch) p.catch(() => {});
       } catch (e) {}
     });
+    log('rtc sender tuned: streams=' + count + ' srcW=' + (srcW || '?') + ' capW=' + capW +
+      ' down=' + (srcW && srcW > capW ? r2s(srcW / capW) : 1) +
+      ' cap=' + Math.round(tier.maxBitrate / 1000) + 'k fps<' + tier.maxFramerate);
   }
 
   function prepareHighQualityStream(stream) {
     if (!stream || typeof stream.getVideoTracks !== 'function') return;
     stream.getVideoTracks().forEach((vt) => {
       try {
-        if ('contentHint' in vt) vt.contentHint = 'detail';
+        if ('contentHint' in vt) vt.contentHint = 'motion';
       } catch (e) {}
     });
   }
@@ -571,6 +878,8 @@
     // 建立本地 WebRTC PeerConnection 直推至伴侣窗口
     const pc = new RTCPeerConnection({ iceServers: [] });
     stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+    // 必须在 createOffer 之前设定：本地回环默认选 VP8（纯 CPU 软编）
+    preferHardwareH264(pc);
     const iceCandidates = [];
 
     // 状态同步定时器
@@ -593,8 +902,9 @@
       });
     }, 250);
 
-    const connEntry = { pc, video, stream, syncTimer, iceCandidates, answerReceived: false, retryTimer: null };
+    const connEntry = { pc, video, stream, syncTimer, iceCandidates, answerReceived: false, retryTimer: null, targetW: size.width };
     companionConnections.set(winId, connEntry);
+    mpStats.watch('companion#' + winId, pc, video, 'out');
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
@@ -661,8 +971,339 @@
       }
       try { conn.pc.close(); } catch (e) {}
       companionConnections.delete(id);
+      mpStats.unwatch('companion#' + id);
     }
     bgSend({ type: 'mp-companion-close', id });
+    refreshStates();
+  }
+
+  /* ------------------- Solo mode: 原生拆窗（零重编码置顶窗） ------------------- */
+
+  /** video -> { token, origTitle, bar } */
+  const soloPopped = new Map();
+  let soloActiveToken = '';
+
+  function soloWindowSize(video) {
+    const availW = (typeof screen !== 'undefined' && screen.availWidth) || 1280;
+    const availH = (typeof screen !== 'undefined' && screen.availHeight) || 720;
+    const vw = video.videoWidth || 16;
+    const vh = video.videoHeight || 9;
+    let w = clamp(Math.round(availW * 0.42), 480, 1600);
+    let h = Math.round(w * (vh / vw));
+    if (h > availH * 0.85) {
+      h = Math.round(availH * 0.85);
+      w = Math.round(h * (vw / vh));
+    }
+    return { width: Math.max(240, w), height: Math.max(140, h) };
+  }
+
+  /* 隔离实现：直接改 CSSOM（setProperty + important），不用注入 <style>。
+   * 原因：注入的 style 元素受页面 CSP 限制，且拿不到站点用 !important 写的行内样式。
+   * 另一条关键策略是“隐藏旁系节点”：只保留从 <body> 到视频的这条祖先链，
+   * 页面其它内容（顶栏/侧栏/评论区/推荐位）一律 display:none。 */
+
+  /** el -> 修改前的 style.cssText，用于精确还原 */
+  const soloSaved = new Map();
+
+  function soloSet(el, prop, value) {
+    if (!el || !el.style) return;
+    if (!soloSaved.has(el)) soloSaved.set(el, el.style.cssText);
+    try { el.style.setProperty(prop, value, 'important'); } catch (e) {}
+  }
+
+  function soloRestoreAll() {
+    for (const [el, css] of soloSaved) {
+      try { el.style.cssText = css; } catch (e) {}
+    }
+    soloSaved.clear();
+  }
+
+  /** parentElement 不跨 Shadow DOM，这里补上 host，兼容 shadow 里的播放器 */
+  function soloParent(n) {
+    if (!n) return null;
+    if (n.parentElement) return n.parentElement;
+    try {
+      const root = n.getRootNode ? n.getRootNode() : null;
+      if (root && root.host) return root.host;
+    } catch (e) {}
+    return null;
+  }
+
+  const SOLO_FULL = {
+    position: 'fixed', top: '0', left: '0', right: '0', bottom: '0',
+    width: '100vw', height: '100vh',
+    'max-width': 'none', 'max-height': 'none', 'min-width': '0', 'min-height': '0',
+    margin: '0', padding: '0',
+    transform: 'none', filter: 'none', contain: 'none',
+    overflow: 'hidden', 'z-index': '2147483600', background: '#000',
+    'border-radius': '0', 'box-shadow': 'none',
+  };
+
+  const SOLO_ANC = {
+    transform: 'none', filter: 'none', perspective: 'none', 'backdrop-filter': 'none',
+    contain: 'none', overflow: 'visible', 'clip-path': 'none',
+    'will-change': 'auto', isolation: 'auto', 'transform-style': 'flat',
+  };
+
+  /** 让任意元素铺满视口：解掉祖先的包含块/裁剪，并隐藏这一层的所有旁系兄弟。 */
+  function soloFillViewport(el) {
+    for (const k in SOLO_FULL) soloSet(el, k, SOLO_FULL[k]);
+    if (el.tagName === 'VIDEO') soloSet(el, 'object-fit', 'contain');
+    if (el.tagName === 'IFRAME') {
+      soloSet(el, 'border', '0');
+      soloSet(el, 'object-fit', 'contain');
+    }
+
+    for (let n = soloParent(el); n && n !== document.documentElement; n = soloParent(n)) {
+      for (const k in SOLO_ANC) soloSet(n, k, SOLO_ANC[k]);
+    }
+
+    // 隐藏旁系节点：只留“通往视频的这一条链”
+    let hidden = 0;
+    for (let n = el; n && n !== document.documentElement; n = soloParent(n)) {
+      const p = soloParent(n);
+      if (!p) break;
+      for (const sib of Array.from(p.children)) {
+        if (sib === n) continue;
+        const tag = sib.tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'TEMPLATE') continue;
+        const sid = sib.id || '';
+        if (sid.indexOf('__multipip__') === 0 || sid.indexOf('mp-solo') === 0) continue;
+        soloSet(sib, 'display', 'none');
+        hidden++;
+      }
+    }
+
+    soloSet(document.documentElement, 'overflow', 'hidden');
+    if (document.body) soloSet(document.body, 'overflow', 'hidden');
+    return hidden;
+  }
+
+  /** 向上找一层“播放器容器”（含控制条/弹幕层），但不把带评论/侧栏的整页容器当视频容器。 */
+  function soloTargetNode(video) {
+    let node = video;
+    for (let i = 0; i < 5; i++) {
+      const p = node.parentElement;
+      if (!p || p === document.body || p === document.documentElement) break;
+      const r = p.getBoundingClientRect();
+      // 只往上爬到"仍然是播放器"的那一层：面积不能小于 1/4 视口，且不能把别的视频也圈进来
+      if (!(r.width >= window.innerWidth * 0.25 && r.height >= window.innerHeight * 0.2)) break;
+      if (p.querySelectorAll('video').length > 1) break;
+      node = p;
+    }
+    return node;
+  }
+
+  function applySoloIsolation(video) {
+    const target = soloTargetNode(video);
+    const hidden = soloFillViewport(target);
+    const inFrame = window.self !== window.top;
+    log('solo isolate:', target.tagName + '.' + (target.className || '').toString().slice(0, 40),
+      'rect=', target.getBoundingClientRect().width + 'x' + target.getBoundingClientRect().height,
+      'hiddenSiblings=', hidden, 'inFrame=', inFrame);
+
+    // 视频在跨域 iframe 里：让顶层把承载它的 <iframe> 也铺满
+    if (inFrame) {
+      try {
+        window.parent.postMessage({ __mpSolo: 'fill-frame' }, '*');
+      } catch (e) {}
+    }
+    return target;
+  }
+
+  // 顶层帧：收到子帧求助后，把承载它的 <iframe> 元素本身铺满视口
+  window.addEventListener('message', (ev) => {
+    const d = ev && ev.data;
+    if (!d || typeof d !== 'object' || d.__mpSolo !== 'fill-frame' || !ev.source) return;
+    const frames = document.querySelectorAll('iframe, frame');
+    for (const f of frames) {
+      if (f.contentWindow === ev.source) {
+        log('solo isolate: framing <iframe> for child frame', f.src ? String(f.src).slice(0, 60) : '');
+        soloFillViewport(f);
+        break;
+      }
+    }
+  }, false);
+
+  function soloVideoByToken(token) {
+    for (const [video, rec] of soloPopped) {
+      if (rec.token === token) return video;
+    }
+    return null;
+  }
+
+  function buildSoloBar(token, hooks) {
+    const bar = document.createElement('div');
+    bar.id = 'mp-solo-bar';
+    Object.assign(bar.style, {
+      position: 'fixed', top: '10px', right: '10px', zIndex: '2147483647',
+      display: 'flex', alignItems: 'center', gap: '6px', padding: '5px 6px',
+      borderRadius: '9px', background: 'rgba(14,16,22,.84)',
+      backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,.18)',
+      boxShadow: '0 6px 18px rgba(0,0,0,.5)',
+      font: '12px/1 system-ui, "Segoe UI", sans-serif', color: '#fff',
+      opacity: '0', transition: 'opacity .18s', pointerEvents: 'none',
+    });
+
+    const mkBtn = (label, title) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.title = title;
+      Object.assign(b.style, {
+        cursor: 'pointer', border: '1px solid rgba(255,255,255,.22)',
+        background: 'rgba(255,255,255,.1)', color: '#fff',
+        borderRadius: '6px', padding: '4px 8px', font: 'inherit', whiteSpace: 'nowrap',
+      });
+      return b;
+    };
+
+    const recall = mkBtn('\u53ec\u56de\u539f\u7a97\u53e3', '\u628a\u7f51\u9875\u6807\u7b7e\u539f\u8def\u79fb\u56de\u539f\u6765\u7684\u6d4f\u89c8\u5668\u7a97\u53e3');
+    recall.onclick = () => {
+      bgSend({ type: 'mp-solo-recall', token }).then((r) => {
+        if (!r || !r.ok) toast('\u53ec\u56de\u5931\u8d25\uff1a' + ((r && r.error) || '\u672a\u77e5\u539f\u56e0'));
+      });
+    };
+
+    let topmostOn = true;
+    const pin = mkBtn('\u53d6\u6d88\u7f6e\u9876', '\u5207\u6362\u8fd9\u4e2a\u7a97\u53e3\u662f\u5426\u59cb\u7ec8\u7f6e\u9876');
+    pin.onclick = () => {
+      const next = !topmostOn;
+      bgSend({ type: 'mp-solo-topmost', token, on: next }).then((r) => {
+        if (!r || !r.ok) {
+          toast('\u7f6e\u9876\u5207\u6362\u5931\u8d25\uff1a' + ((r && r.error) || '\u8bf7\u5148\u8fd0\u884c companion/register_host.bat'), 6000);
+          return;
+        }
+        topmostOn = next;
+        pin.textContent = next ? '\u53d6\u6d88\u7f6e\u9876' : '\u6062\u590d\u7f6e\u9876';
+      });
+    };
+
+    const repave = mkBtn('重新铺满', '页面重排后画面不对时点一下，重新把视频铺满窗口');
+    repave.onclick = () => { if (hooks && typeof hooks.repave === 'function') hooks.repave(); };
+
+    const hint = document.createElement('span');
+    hint.textContent = '\u539f\u751f\u62c6\u7a97 \u00b7 \u96f6\u91cd\u7f16\u7801';
+    hint.style.cssText = 'color:#9aa4ad;font-size:11px;';
+
+    bar.appendChild(hint);
+    bar.appendChild(repave);
+    bar.appendChild(pin);
+    bar.appendChild(recall);
+
+    let hideTimer = null;
+    const show = () => {
+      bar.style.opacity = '1';
+      bar.style.pointerEvents = 'auto';
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => {
+        if (bar.matches(':hover')) return;
+        bar.style.opacity = '0';
+        bar.style.pointerEvents = 'none';
+      }, 1800);
+    };
+    bar.addEventListener('mouseenter', () => { if (hideTimer) clearTimeout(hideTimer); });
+    bar.addEventListener('mouseleave', show);
+    document.addEventListener('mousemove', (ev) => {
+      if (ev.clientY < 100 || ev.clientX > window.innerWidth - 320) show();
+    }, true);
+
+    (document.body || document.documentElement).appendChild(bar);
+    return {
+      remove() { bar.remove(); },
+      setTopmostState(ok, error) {
+        topmostOn = ok;
+        pin.textContent = ok ? '\u53d6\u6d88\u7f6e\u9876' : '\u6062\u590d\u7f6e\u9876';
+        if (!ok && error) toast('\u7f6e\u9876\u5931\u8d25\uff1a' + error + '\uff08\u8bf7\u5148\u8fd0\u884c companion/register_host.bat\uff09', 7000);
+      },
+    };
+  }
+
+  /** 原生拆窗：把视频所在的标签页整体挑进置顶 popup 窗口，页面本身直接铺满。
+   *  零重编码、零拷贝、支持 DRM；多开等价于多开普通标签页（各自硬件解码）。 */
+  async function popOutSolo(video) {
+    if (soloPopped.has(video)) {
+      toast('\u8fd9\u4e2a\u89c6\u9891\u5df2\u7ecf\u5728\u62c6\u7a97\u6a21\u5f0f\u4e0b\u4e86');
+      return;
+    }
+    const token = 'MP' + Math.random().toString(36).slice(2, 9).toUpperCase();
+    const size = soloWindowSize(video);
+    const origTitle = document.title;
+
+    // 必须先把 token 写进标题：宿主是按窗口标题里的 token 认领 HWND 的
+    try { document.title = token + ' \u00b7 ' + origTitle; } catch (e) {}
+
+    const resp = await bgSend({ type: 'mp-solo-open', token, width: size.width, height: size.height });
+    if (!resp || !resp.ok) {
+      try { document.title = origTitle; } catch (e) {}
+      toast('\u62c6\u7a97\u5931\u8d25\uff1a' + ((resp && resp.error) || '\u672a\u77e5\u539f\u56e0'), 6000);
+      return;
+    }
+
+    soloActiveToken = token;
+    const target = applySoloIsolation(video);
+    const barHooks = { repave: null };
+    const bar = buildSoloBar(token, barHooks);
+
+    // 部分站点会自己重写 document.title，持续把 token 顶在最前面（宿主靠它认领 HWND）
+    let titleObserver = null;
+    const titleTag = document.querySelector('title');
+    if (titleTag && typeof MutationObserver !== 'undefined') {
+      titleObserver = new MutationObserver(() => {
+        const t = document.title;
+        if (t.indexOf(token) < 0) {
+          try { document.title = token + ' · ' + t; } catch (e) {}
+        }
+      });
+      titleObserver.observe(titleTag, { childList: true, characterData: true, subtree: true });
+    }
+
+    // 站点常因尺寸变化重排甚至重建 DOM：窗口 resize 后重新铺一次
+    const reapply = () => {
+      if (!soloPopped.has(video)) return;
+      try {
+        soloRestoreAll();
+        if (video.isConnected) soloFillViewport(soloTargetNode(video));
+        if (window.self !== window.top) {
+          window.parent.postMessage({ __mpSolo: 'fill-frame' }, '*');
+        }
+      } catch (e) {}
+    };
+    window.addEventListener('resize', reapply);
+    barHooks.repave = reapply;
+
+    soloPopped.set(video, { token, origTitle, bar, titleObserver, reapply });
+
+    // 页面自己的播放器可能会因尺寸突变暂停，兜底拉一次播放
+    setTimeout(() => {
+      try {
+        if (video.paused) {
+          const p = video.play();
+          if (p && p.catch) p.catch(() => {});
+        }
+      } catch (e) {}
+    }, 300);
+
+    refreshStates();
+    log('solo window opened:', resp.winId, token, 'target:', target && target.tagName);
+  }
+
+  function teardownSolo(video) {
+    const rec = soloPopped.get(video);
+    if (rec) {
+      soloPopped.delete(video);
+      if (rec.titleObserver) { try { rec.titleObserver.disconnect(); } catch (e) {} }
+      if (rec.reapply) { try { window.removeEventListener('resize', rec.reapply); } catch (e) {} }
+      if (rec.bar) { try { rec.bar.remove(); } catch (e) {} }
+      try {
+        if (document.title.indexOf(rec.token) === 0) document.title = rec.origTitle;
+      } catch (e) {}
+    }
+    if (soloPopped.size === 0) {
+      soloRestoreAll();
+      const st = document.getElementById('mp-solo-style'); // 兼容旧版本注入的样式
+      if (st) st.remove();
+      soloActiveToken = '';
+    }
     refreshStates();
   }
 
@@ -2066,6 +2707,8 @@
     const connId = nextDockSourceId++;
     const pc = new RTCPeerConnection({ iceServers: [] });
     stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+    // 必须在 createOffer 之前设定：本地回环默认选 VP8（纯 CPU 软编）
+    preferHardwareH264(pc);
 
     let dockOwnerId = null;
     const who = await bgSend({ type: 'mp-dock-who' });
@@ -2121,6 +2764,7 @@
     }, 400);
 
     rtcConnections.set(connId, { pc, video, stream, syncTimer, dockOwnerId });
+    mpStats.watch('dock-src#' + connId, pc, video, 'out');
     dockCrossPopped.add(video);
     dockCrossIds.set(video, connId);
     protectSourceVideo(video);
@@ -2148,6 +2792,7 @@
         clearInterval(syncTimer);
         pc.close();
         rtcConnections.delete(connId);
+        mpStats.unwatch('dock-src#' + connId);
         restoreCrossSourceVideo(video);
         dockCrossPopped.delete(video);
         dockCrossIds.delete(video);
@@ -2161,6 +2806,7 @@
       clearInterval(syncTimer);
       pc.close();
       rtcConnections.delete(connId);
+      mpStats.unwatch('dock-src#' + connId);
       restoreCrossSourceVideo(video);
       dockCrossPopped.delete(video);
       dockCrossIds.delete(video);
@@ -2180,6 +2826,7 @@
     }
     try { conn.pc.close(); } catch (e) {}
     rtcConnections.delete(connId);
+    mpStats.unwatch('dock-src#' + connId);
     if (conn.video) {
       restoreCrossSourceVideo(conn.video);
       unprotectSourceVideo(conn.video);
@@ -2311,6 +2958,7 @@
         nativePopped.size > 0 ||
         companionPopped.size > 0 ||
         dockCrossPopped.size > 0
+        || soloPopped.size > 0
       );
       if (hasActive) {
         e.preventDefault();
@@ -2318,6 +2966,10 @@
         for (const v of Array.from(nativePopped)) recallNative(v);
         for (const v of Array.from(companionPopped.keys())) recallCompanion(v);
         for (const v of Array.from(dockCrossPopped)) recallCrossDock(v);
+        for (const [sv, srec] of Array.from(soloPopped)) {
+          bgSend({ type: 'mp-solo-recall', token: srec.token });
+          teardownSolo(sv);
+        }
         refreshStates();
         toast('\u5df2\u53ec\u56de\u89c6\u9891\u81f3\u539f\u9875\u9762', 1500);
         return;
@@ -2403,6 +3055,8 @@
     dock: '❖ 原生小窗 (多视频坞)',
     native: '🗔 原生画中画',
     companion: '🗗 无边框原生窗',
+    solo: '原生拆窗：把视频所在的标签页整体挑进置顶 popup 小窗（同一个页面实例，不重载、不编码）：零重编码、零画质损耗、支持 DRM、可无限多开。代价：整个标签页被搬走（不能同时留在原页刷评论）',
+    solo: '🧲 原生拆窗',
   };
 
   function updateAllBadgesUI() {
@@ -2503,6 +3157,7 @@
         ['dock', '❖ 原生小窗 (多视频坞)'],
         ['native', '🗔 原生画中画'],
         ['companion', '🗗 无边框原生窗'],
+        ['solo', '🧲 原生拆窗 (零重编码置顶)'],
       ].forEach(([k, label]) => {
         const item = document.createElement('div');
         item.textContent = (cur === k ? '✓ ' : '  ') + label;
@@ -3043,7 +3698,7 @@
   function renderModeBar() {
     modeBar.textContent = '';
     const cur = modeStore.get();
-    [['dock', '❖ \u539f\u751f\u5c0f\u7a97'], ['native', '🗔 \u539f\u751f\u753b\u4e2d\u753b'], ['companion', '🗗 \u65e0\u8fb9\u6846\u7a97']].forEach(([key, label]) => {
+    [['dock', '❖ \u539f\u751f\u5c0f\u7a97'], ['native', '🗔 \u539f\u751f\u753b\u4e2d\u753b'], ['companion', '🗗 \u65e0\u8fb9\u6846\u7a97'], ['solo', '🧲 拆窗']].forEach(([key, label]) => {
       const b = document.createElement('button');
       b.textContent = label;
       b.title = MODE_HINT[key];
@@ -3166,6 +3821,7 @@
         if (homes.has(v)) restoreVideo(v);
         else if (nativePopped.has(v)) recallNative(v);
         else if (dockCrossPopped.has(v)) recallCrossDock(v);
+        else if (soloPopped.has(v)) bgSend({ type: 'mp-solo-recall', token: soloPopped.get(v).token });
         else recallCompanion(v);
         refreshStates();
       });
@@ -3193,6 +3849,8 @@
       ? '\u7f6e\u9876\u7a97\uff1a' + (dock.cards ? dock.cards.length : dock.list.length) + ' \u4e2a\u89c6\u9891'
       : nativePopped.size
         ? '\u7cfb\u7edf\u753b\u4e2d\u753b\uff1a' + nativePopped.size + ' \u4e2a\u89c6\u9891'
+        : soloPopped.size
+          ? '原生拆窗：' + soloPopped.size + ' 个视频'
         : companionPopped.size
           ? '\u65e0\u8fb9\u6846\u7a97\uff1a' + companionPopped.size + ' \u4e2a\u89c6\u9891'
           : '\u672a\u5f00\u542f';
@@ -3202,7 +3860,7 @@
     panelRows.forEach(({ v, info, btn, recallBtn, speedBtn }, i) => {
       const size = v.videoWidth ? `${v.videoWidth}x${v.videoHeight}` : '\u5c3a\u5bf8\u672a\u77e5';
       const dur = Number.isFinite(v.duration) && v.duration > 0 ? fmtTime(v.duration) : '\u65f6\u957f\u672a\u77e5';
-      const popped = homes.has(v) || nativePopped.has(v) || companionPopped.has(v) || dockCrossPopped.has(v);
+      const popped = homes.has(v) || nativePopped.has(v) || companionPopped.has(v) || dockCrossPopped.has(v) || soloPopped.has(v);
       info.textContent = `#${i + 1} \u00b7 ${size} \u00b7 ${dur}${popped ? ' \u00b7 \u5df2\u5f39\u51fa' : ''}`;
       btn.textContent = popped ? '\u5df2\u5f39\u51fa' : '\u5f39\u51fa';
       btn.disabled = popped;
@@ -3243,6 +3901,18 @@
         sendResponse({ ok: cycleSpeedOfActive() });
         return true;
       }
+      // 原生拆窗：召回时撤销 CSS 隔离；置顶状态回报用来点亮/提示按钮
+      if (msg && msg.type === 'mp-solo-restore') {
+        const hit = soloVideoByToken(msg.token);
+        if (hit) teardownSolo(hit);
+        return true;
+      }
+      if (msg && msg.type === 'mp-solo-topmost-state') {
+        const hit = soloVideoByToken(msg.token);
+        const rec = hit ? soloPopped.get(hit) : null;
+        if (rec && rec.bar && rec.bar.setTopmostState) rec.bar.setTopmostState(!!msg.ok, msg.error || '');
+        return true;
+      }
       if (msg && msg.type === 'mp-tab-video-count') {
         reportedTabVideoCount = Number(msg.total) || 0;
         updateFabVisibility();
@@ -3265,6 +3935,10 @@
         for (const v of Array.from(nativePopped)) recallNative(v);
         for (const v of Array.from(companionPopped.keys())) recallCompanion(v);
         for (const v of Array.from(dockCrossPopped)) recallCrossDock(v);
+        for (const [sv, srec] of Array.from(soloPopped)) {
+          bgSend({ type: 'mp-solo-recall', token: srec.token });
+          teardownSolo(sv);
+        }
         refreshStates();
         toast('\u5df2\u53ec\u56de\u5168\u90e8\u89c6\u9891');
         return true;
@@ -3276,6 +3950,7 @@
           const connId = msg.connId;
           const remotePc = new RTCPeerConnection({ iceServers: [] });
           const card = addRtcCard(dock, remotePc, msg.meta, fromTab, connId);
+          mpStats.watch('dock-in#' + connId, remotePc, card.media, 'in');
 
           remotePc.ontrack = (event) => {
             log('dock owner: WebRTC track received:', event.track ? event.track.kind : 'unknown');
@@ -3337,7 +4012,7 @@
             sdp: boostWebRtcVideoSdp(msg.answer.sdp),
           };
           conn.pc.setRemoteDescription(new RTCSessionDescription(hqAnswer)).then(() => {
-            applyHighQualityRtcSenders(conn.pc);
+            applyHighQualityRtcSenders(conn.pc, conn.video, conn.targetW, rtcConnections.size);
             log('WebRTC HQ connection established between tabs for connId:', msg.connId);
           }).catch((err) => {
             log('setRemoteDescription on answer failed:', err);
@@ -3457,7 +4132,7 @@
               sdp: boostWebRtcVideoSdp(data.answer.sdp),
             };
             conn.pc.setRemoteDescription(new RTCSessionDescription(hqAnswer)).then(() => {
-              applyHighQualityRtcSenders(conn.pc);
+              applyHighQualityRtcSenders(conn.pc, conn.video, conn.targetW, companionPopped.size);
               if (conn.iceCandidates && conn.iceCandidates.length) {
                 conn.iceCandidates.forEach((cand) => {
                   bgSend({
@@ -3518,6 +4193,7 @@
               }
               try { conn.pc.close(); } catch (e) {}
               companionConnections.delete(id);
+              mpStats.unwatch('companion#' + id);
             }
           }
         }

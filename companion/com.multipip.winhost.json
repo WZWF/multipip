@@ -1,0 +1,9 @@
+{
+  "name": "com.multipip.winhost",
+  "description": "Multi-PiP Win32 always-on-top window host (solo mode)",
+  "path": "D:/code/mix/multipip/companion/dist/multipip_winhost/multipip_winhost.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://eeipfkplhoehahlfkehbahcnpkebhkob/"
+  ]
+}

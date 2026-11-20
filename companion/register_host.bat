@@ -52,6 +52,31 @@ if not exist "%JSON%" (
 echo [OK] Json ready: %JSON%
 echo.
 
+REM ------- solo window host (Win32 topmost, zero re-encode) -------
+set "WINEXE=%DIR%dist\multipip_winhost\multipip_winhost.exe"
+set "WINJSON=%DIR%com.multipip.winhost.json"
+
+if not exist "%WINEXE%" (
+    echo [WARN] solo host missing: %WINEXE%
+    echo        Solo mode cannot stay always-on-top without it.
+) else (
+    set "SLASH_WINEXE=!WINEXE:\=/!"
+    (
+        echo {
+        echo   "name": "com.multipip.winhost",
+        echo   "description": "Multi-PiP Win32 always-on-top window host (solo mode)",
+        echo   "path": "!SLASH_WINEXE!",
+        echo   "type": "stdio",
+        echo   "allowed_origins": [
+        echo     "chrome-extension://eeipfkplhoehahlfkehbahcnpkebhkob/"
+        echo   ]
+        echo }
+    ) > "%WINJSON%"
+    echo [OK] Solo host json ready: %WINJSON%
+)
+echo.
+
+
 echo [2/3] Writing to HKCU registry...
 
 "!REG!" add "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.multipip.host" /ve /t REG_SZ /d "%JSON%" /f >nul 2>&1
@@ -65,6 +90,10 @@ if !errorlevel! equ 0 (echo  - Brave Browser: OK)
 
 "!REG!" add "HKCU\Software\Chromium\NativeMessagingHosts\com.multipip.host" /ve /t REG_SZ /d "%JSON%" /f >nul 2>&1
 if !errorlevel! equ 0 (echo  - Chromium: OK)
+if exist "%WINJSON%" "!REG!" add "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.multipip.winhost" /ve /t REG_SZ /d "%WINJSON%" /f >nul 2>&1
+if exist "%WINJSON%" "!REG!" add "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.multipip.winhost" /ve /t REG_SZ /d "%WINJSON%" /f >nul 2>&1
+if exist "%WINJSON%" "!REG!" add "HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.multipip.winhost" /ve /t REG_SZ /d "%WINJSON%" /f >nul 2>&1
+if exist "%WINJSON%" "!REG!" add "HKCU\Software\Chromium\NativeMessagingHosts\com.multipip.winhost" /ve /t REG_SZ /d "%WINJSON%" /f >nul 2>&1
 
 echo.
 echo [3/3] Verifying registry installation...
