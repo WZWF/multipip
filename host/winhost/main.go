@@ -14,6 +14,7 @@
 //	{"cmd":"drag","token":"..."}                     -> 原生拖动循环（松开左键自动结束）
 //	{"cmd":"resize","token":"...","aspect":1.7778}   -> 等比缩放循环（按住左键期间）
 //	{"cmd":"status","token":"..."}                   -> 调试：是否已置顶/已裁剪
+//	{"cmd":"tile","tokens":["..",".."],"mode":"grid"} -> 按监视器工作区宫格/横排平铺
 //	{"cmd":"detach","token":"..."}                   -> 取消置顶 + 还原窗口区域
 //	{"cmd":"detachAll"} / {"cmd":"quit"}
 //
@@ -79,6 +80,8 @@ var (
 	procCreateRoundRectRgn = gdi32.NewProc("CreateRoundRectRgn")
 	procDeleteObject       = gdi32.NewProc("DeleteObject")
 	procEqualRgn           = gdi32.NewProc("EqualRgn")
+	procMonitorFromWindow  = user32.NewProc("MonitorFromWindow")
+	procGetMonitorInfoW    = user32.NewProc("GetMonitorInfoW")
 )
 
 type point struct{ X, Y int32 }
@@ -91,7 +94,9 @@ type request struct {
 	Topmost *int    `json:"topmost"`
 	Cut     *int    `json:"cut"`
 	Radius  *int    `json:"radius"`
-	Aspect  float64 `json:"aspect"`
+	Aspect  float64  `json:"aspect"`
+	Tokens  []string `json:"tokens"`
+	Mode    string   `json:"mode"`
 }
 
 type target struct {
@@ -312,6 +317,133 @@ func watchRegion(t *target) {
 }
 
 // ---------------------------------------------------------------------------
+// 监视器工作区 / 边缘吸附 / 宫格平铺
+// ---------------------------------------------------------------------------
+
+type monitorInfo struct {
+	cbSize    uint32
+	rcMonitor rect
+	rcWork    rect
+	dwFlags   uint32
+}
+
+func workArea(hwnd uintptr) (rect, bool) {
+	hmon := call(procMonitorFromWindow, hwnd, 2) // MONITOR_DEFAULTTONEAREST
+	if hmon == 0 {
+		return rect{}, false
+	}
+	mi := monitorInfo{cbSize: uint32(unsafe.Sizeof(monitorInfo{}))}
+	if call(procGetMonitorInfoW, hmon, ptr(unsafe.Pointer(&mi))) == 0 {
+		return rect{}, false
+	}
+	return mi.rcWork, true
+}
+
+func visualRect(hwnd uintptr) (x, y, w, h int32, ok bool) {
+	co, ok1 := clientOrigin(hwnd)
+	cr, ok2 := clientRect(hwnd)
+	if !ok1 || !ok2 {
+		return 0, 0, 0, 0, false
+	}
+	return co.X, co.Y, cr.Right - cr.Left, cr.Bottom - cr.Top, true
+}
+
+func abs32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// snapWindow 在拖动结束后把窗口吸附到工作区边缘（阈值 24px，按"可见客户区"算）。
+func snapWindow(hwnd uintptr) {
+	const tol int32 = 24
+	vx, vy, vw, vh, ok := visualRect(hwnd)
+	if !ok {
+		return
+	}
+	work, ok := workArea(hwnd)
+	if !ok {
+		return
+	}
+	nx, ny := vx, vy
+	if abs32(vx-work.Left) < tol {
+		nx = work.Left
+	}
+	if abs32((vx+vw)-work.Right) < tol {
+		nx = work.Right - vw
+	}
+	if abs32(vy-work.Top) < tol {
+		ny = work.Top
+	}
+	if abs32((vy+vh)-work.Bottom) < tol {
+		ny = work.Bottom - vh
+	}
+	if nx == vx && ny == vy {
+		return
+	}
+	wr, ok := windowRect(hwnd)
+	if !ok {
+		return
+	}
+	call(procSetWindowPos, hwnd, 0,
+		uintptr(wr.Left+(nx-vx)), uintptr(wr.Top+(ny-vy)), 0, 0,
+		uintptr(swpNoSize|swpNoZOrder|swpNoActivate))
+}
+
+// tileWindows 按工作区把若干窗口铺成宫格（grid）或横向一列（row）。
+func tileWindows(tokens []string, mode string) int {
+	hwnds := make([]uintptr, 0, len(tokens))
+	for _, tk := range tokens {
+		if t := lookup(tk); t != nil && isAlive(t.hwnd) {
+			hwnds = append(hwnds, t.hwnd)
+		}
+	}
+	n := len(hwnds)
+	if n == 0 {
+		return 0
+	}
+	work, ok := workArea(hwnds[0])
+	if !ok {
+		return 0
+	}
+	const gap int32 = 8
+
+	var cols, rows int32
+	if mode == "row" {
+		cols, rows = int32(n), 1
+	} else {
+		cols = 1
+		for cols*cols < int32(n) {
+			cols++
+		}
+		rows = (int32(n) + cols - 1) / cols
+	}
+	totalW := work.Right - work.Left
+	totalH := work.Bottom - work.Top
+	w := (totalW - gap*(cols+1)) / cols
+	h := (totalH - gap*(rows+1)) / rows
+	if w < 160 || h < 90 {
+		return 0
+	}
+	applied := 0
+	for i, hwnd := range hwnds {
+		idx := int32(i)
+		col := idx % cols
+		row := idx / cols
+		x := work.Left + gap + col*(w+gap)
+		y := work.Top + gap + row*(h+gap)
+		// 平铺的是"窗口外框"，客户区会比它小一点；对拆窗（已裁边）影响很小
+		if call(procSetWindowPos, hwnd, 0, uintptr(x), uintptr(y),
+			uintptr(w), uintptr(h),
+			uintptr(swpNoZOrder|swpNoActivate)) != 0 {
+			applied++
+		}
+	}
+	return applied
+}
+
+// ---------------------------------------------------------------------------
 // 原生拖动 / 等比缩放
 // ---------------------------------------------------------------------------
 
@@ -328,6 +460,7 @@ func dragLoop(t *target, stop chan struct{}) {
 		default:
 		}
 		if !isAlive(t.hwnd) || !lbuttonDown() {
+			snapWindow(t.hwnd) // 松手后吸附到屏幕边缘
 			return
 		}
 		p := cursorPos()
@@ -541,6 +674,10 @@ func handle(req request) {
 			"window": []int32{wr.Left, wr.Top, wr.Right - wr.Left, wr.Bottom - wr.Top},
 			"client": []int32{cr.Right - cr.Left, cr.Bottom - cr.Top},
 		})
+
+	case "tile":
+		applied := tileWindows(req.Tokens, req.Mode)
+		send(map[string]interface{}{"ok": applied > 0, "applied": applied, "total": len(req.Tokens), "mode": req.Mode})
 
 	case "detach":
 		mu.Lock()

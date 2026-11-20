@@ -401,6 +401,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'mp-solo-info') {
+    sendResponse({
+      ok: true,
+      count: soloWindows.size,
+      items: Array.from(soloWindows.values()).map((r) => ({ token: r.token, winId: r.winId })),
+    });
+    return true;
+  }
+
+  if (msg.type === 'mp-solo-tile') {
+    const tokens = Array.from(soloWindows.values()).map((r) => r.token);
+    if (!tokens.length) {
+      sendResponse({ ok: false, error: '没有拆窗窗口' });
+      return true;
+    }
+    const posted = winHostPost({ cmd: 'tile', tokens, mode: msg.mode === 'row' ? 'row' : 'grid' });
+    sendResponse({ ok: posted, error: posted ? '' : winHostLastError, count: tokens.length });
+    return true;
+  }
+
   if (msg.type === 'mp-win-ping') {
     sendResponse({ ok: !!winHostConnect(), error: winHostLastError });
     return true;
@@ -551,6 +571,7 @@ function winHostConnect() {
   winPort.onMessage.addListener((m) => {
     if (!m) return;
     if (m.event === 'ready') return;
+    // 平铺/状态类回报没有 token，直接丢弃
     if (!m.token) return;
     const rec = soloByToken.get(m.token);
     if (rec && rec.tabId != null) {

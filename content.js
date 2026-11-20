@@ -1485,6 +1485,23 @@
     window.addEventListener('resize', reapply);
     barHooks.repave = reapply;
 
+    // 守护：站点可能自己重排/重设行内样式，把视频又挤出视口。发现"没铺满"就自动重铺。
+    const guard = setInterval(() => {
+      if (!soloPopped.has(video)) { clearInterval(guard); return; }
+      if (!video.isConnected) return;
+      try {
+        const r = video.getBoundingClientRect();
+        const covered = r.width >= window.innerWidth * 0.92 && r.height >= window.innerHeight * 0.78;
+        const stray = rec.adopted ? !(rec.stage && rec.stage.contains(video)) : false;
+        if (!covered || stray) {
+          log('solo guard: drift detected -> re-apply',
+            Math.round(r.width) + 'x' + Math.round(r.height));
+          reapply();
+        }
+      } catch (e) {}
+    }, 1200);
+    rec.guard = guard;
+
     rec.bar = bar;
     rec.titleObserver = titleObserver;
     rec.reapply = reapply;
@@ -1511,6 +1528,7 @@
       soloPopped.delete(video);
       if (rec.titleObserver) { try { rec.titleObserver.disconnect(); } catch (e) {} }
       if (rec.reapply) { try { window.removeEventListener('resize', rec.reapply); } catch (e) {} }
+      if (rec.guard) { try { clearInterval(rec.guard); } catch (e) {} }
       if (rec.bar) { try { rec.bar.remove(); } catch (e) {} }
       try {
         if (document.title.indexOf(rec.token) === 0) document.title = rec.origTitle;
@@ -1698,6 +1716,7 @@
   function setupDockDoc(d) {
     const doc = d.doc;
     d.cards = [];
+    watchDockVisibility(d);
     d.layout = 'stack';
     d.free = false;
     d.focused = null;
@@ -2400,7 +2419,7 @@
           }
         },
         speed: (r) => { v.playbackRate = r; },
-        volume: (x) => { v.volume = Math.min(1, Math.max(0, x)); v.muted = x <= 0; },
+        volume: (x) => { v.volume = Math.min(1, Math.max(0, x)); }, // 不要动 muted：源页静音由 hideCrossSourceVideo 统一管
         paused: () => v.paused,
         time: () => v.currentTime,
         duration: () => v.duration,
@@ -2542,6 +2561,34 @@
   }
 
   /** Fullscreen one card inside the dock window; others pause + hide. */
+  /** 坞窗整窗不可见（最小化/被完全遮挡）时，把所有 WebRTC 卡片一起挂起。
+   *  与单卡全屏挂起共用 wasSuspended 标记，避免互相"误唤醒"。 */
+  function setAllRtcSuspended(d, on) {
+    if (!d) return;
+    const changed = d.allSuspended !== on;
+    d.allSuspended = on;
+    (d.cards || []).forEach((c) => {
+      if (c.kind !== 'rtc' || !c.ctl || !c.ctl.suspend) return;
+      if (on) c.ctl.suspend(true);
+      else if (!c.wasSuspended) c.ctl.suspend(false);
+    });
+    if (changed) log('dock window', on ? 'hidden -> suspend all rtc cards' : 'visible -> resume');
+  }
+
+  function watchDockVisibility(d) {
+    const doc = d && d.doc;
+    if (!doc || typeof doc.addEventListener !== 'function') return;
+    const sync = () => setAllRtcSuspended(d, doc.visibilityState === 'hidden');
+    doc.addEventListener('visibilitychange', sync, false);
+    try {
+      if (d.win && typeof d.win.addEventListener === 'function') {
+        d.win.addEventListener('pagehide', () => setAllRtcSuspended(d, true), false);
+        d.win.addEventListener('pageshow', sync, false);
+      }
+    } catch (e) { /* cross-origin guard */ }
+    sync();
+  }
+
   function enterFullscreen(d, card) {
     if (d.fullscreen) return;
     d.fullscreen = card;
@@ -2676,6 +2723,7 @@
     attachCardGeometry(doc, d, card);
     d.cards.push(card);
     d.body.appendChild(slot);
+    if (d.allSuspended && card.ctl && card.ctl.suspend) card.ctl.suspend(true);
     syncDockGeometry(d);
     log('WebRTC card created for dock, connId:', connId);
     return card;
@@ -2737,6 +2785,7 @@
     attachCardGeometry(doc, d, card);
     d.cards.push(card);
     d.body.appendChild(slot);
+    if (d.allSuspended && card.ctl && card.ctl.suspend) card.ctl.suspend(true);
     syncDockGeometry(d);
     log('embed card added:', url.slice(0, 60));
     return card;
@@ -2891,6 +2940,12 @@
     video.muted = false;
   }
 
+  /* 音频唯一性原则（审计结论）：
+   *   - 走 WebRTC 的模式（坞窗跨标签 / 无边框伴侣窗）：音频随 stream 进入小窗播放，
+   *     源页由 applySilentMute(true) 静音 —— 只有小窗出声。
+   *   - 同页 adopt（坞窗 direct / 拆窗）：不搬家、不静音，源页自己出声。
+   *   - 因此任何控制指令都【不能】去解除源页静音，否则立刻变成双声。
+   *     （历史上 volume 指令里的 v.muted = x <= 0 就是这个坑，已移除。） */
   function hideCrossSourceVideo(video) {
     if (!video || video._mpCrossHidden) return;
     video._mpCrossHidden = true;
@@ -3836,6 +3891,81 @@
   });
   statusRow.append(statusText, newTabBtn);
 
+  // ------------------------- 原生拆窗：窗口平铺 + 宿主状态 -------------------------
+  const soloTools = document.createElement('div');
+  Object.assign(soloTools.style, {
+    display: 'none',
+    alignItems: 'center',
+    gap: '6px',
+    margin: '0 4px 8px',
+    padding: '6px',
+    background: 'rgba(255,255,255,0.06)',
+    borderRadius: '8px',
+    flexWrap: 'wrap',
+  });
+
+  const soloLabel = document.createElement('span');
+  soloLabel.textContent = '拆窗窗口:';
+  Object.assign(soloLabel.style, { fontSize: '12px', opacity: '.8', whiteSpace: 'nowrap' });
+  soloTools.appendChild(soloLabel);
+
+  const soloCountText = document.createElement('span');
+  soloCountText.textContent = '0 个';
+  Object.assign(soloCountText.style, { fontSize: '12px', opacity: '.9', whiteSpace: 'nowrap' });
+  soloTools.appendChild(soloCountText);
+
+  const mkSoloTool = (label, title, onClick) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.title = title;
+    Object.assign(b.style, {
+      cursor: 'pointer',
+      border: '1px solid rgba(255,255,255,.2)',
+      background: 'rgba(255,255,255,.1)',
+      color: '#fff',
+      borderRadius: '6px',
+      padding: '4px 8px',
+      font: 'inherit',
+      fontSize: '11.5px',
+      whiteSpace: 'nowrap',
+    });
+    b.addEventListener('click', onClick);
+    return b;
+  };
+
+  soloTools.appendChild(mkSoloTool('\u5bab\u683c\u5e73\u94fa', '\u628a\u6240\u6709\u62c6\u7a97\u7a97\u53e3\u6309\u5bab\u683c\u5e73\u94fa\u5230\u5f53\u524d\u5c4f\u5e55', () => {
+    bgSend({ type: 'mp-solo-tile', mode: 'grid' }).then((r) => {
+      if (!r || !r.ok) toast('\u5e73\u94fa\u5931\u8d25\uff1a' + ((r && r.error) || '\u5bbf\u4e3b\u672a\u8fde\u63a5'), 5000);
+      else toast('\u5df2\u5e73\u94fa ' + r.count + ' \u4e2a\u62c6\u7a97\u7a97\u53e3');
+    });
+  }));
+
+  soloTools.appendChild(mkSoloTool('\u6a2a\u6392', '\u6240\u6709\u62c6\u7a97\u7a97\u53e3\u4e00\u5b57\u6a2a\u5411\u6392\u5f00', () => {
+    bgSend({ type: 'mp-solo-tile', mode: 'row' }).then((r) => {
+      if (!r || !r.ok) toast('\u6392\u5217\u5931\u8d25\uff1a' + ((r && r.error) || '\u5bbf\u4e3b\u672a\u8fde\u63a5'), 5000);
+      else toast('\u5df2\u6392\u5217 ' + r.count + ' \u4e2a\u62c6\u7a97\u7a97\u53e3');
+    });
+  }));
+
+  // 宿主没装/没连上时，直接把状态顶在面板上，省得去翻控制台
+  const soloHostState = document.createElement('span');
+  Object.assign(soloHostState.style, { fontSize: '11px', opacity: '.75', whiteSpace: 'nowrap' });
+  soloTools.appendChild(soloHostState);
+
+  async function refreshSoloTools() {
+    const info = await bgSend({ type: 'mp-solo-info' });
+    const n = info && typeof info.count === 'number' ? info.count : 0;
+    soloCountText.textContent = n + ' \u4e2a';
+    soloTools.style.display = n > 0 ? 'flex' : 'none';
+    if (n <= 0) return;
+    const ping = await bgSend({ type: 'mp-win-ping' });
+    const ok = !!(ping && ping.ok);
+    soloHostState.textContent = ok
+      ? '\u5bbf\u4e3b\u5df2\u8fde\u63a5'
+      : '\u5bbf\u4e3b\u672a\u8fde\u63a5\uff08\u8bf7\u8fd0\u884c companion/register_host.bat\uff09';
+    soloHostState.style.color = ok ? '#7fd7a5' : '#ff9b9b';
+  }
+
   // ------------------------- 无边框原生窗智能多窗自动平铺布局 -------------------------
   const companionLayoutBar = document.createElement('div');
   Object.assign(companionLayoutBar.style, {
@@ -4034,6 +4164,8 @@
     panel.appendChild(modeBar);
     renderModeBar();
     panel.appendChild(statusRow);
+    panel.appendChild(soloTools);
+    refreshSoloTools();
     panel.appendChild(companionLayoutBar);
 
     const head = document.createElement('div');
@@ -4174,6 +4306,7 @@
         speedBtn.textContent = (v.playbackRate || 1) + '\u00d7';
       }
     });
+    refreshSoloTools();
   }
 
   // 定时检测当前页面是否有有效视频，控制边缘悬浮球显隐，并在面板展开时自动刷新状态
@@ -4412,7 +4545,11 @@
             const rc = msg.id != null ? rtcConnections.get(msg.id) : null;
             if (rc && rc.pc) setRtcSenderActive(rc.pc, msg.value === false);
           }
-          else if (msg.op === 'volume') { const x = Number(msg.value); if (!isNaN(x)) { v.volume = Math.min(1, Math.max(0, x)); v.muted = x <= 0; } }
+          else if (msg.op === 'volume') {
+            // 只改音量：源页此时是 opacity:0 的隐藏播放器，一旦被解除静音就会和卡片双声
+            const x = Number(msg.value);
+            if (!isNaN(x)) v.volume = Math.min(1, Math.max(0, x));
+          }
         }
       }
       if (msg && msg.type === 'mp-dock-recall') {
