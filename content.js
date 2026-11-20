@@ -1052,6 +1052,49 @@
    * 另一条关键策略是“隐藏旁系节点”：只保留从 <body> 到视频的这条祖先链，
    * 页面其它内容（顶栏/侧栏/评论区/推荐位）一律 display:none。 */
 
+  /** 是否隐藏"旁系节点"（页面其余内容）。默认开；
+   *  某些站点把播放控制条放在视频容器的兄弟节点上，关掉就不再隐藏任何东西。 */
+  const SOLO_HIDE_KEY = NS + ':hideOthers';
+  function soloHidePref() {
+    try { return localStorage.getItem(SOLO_HIDE_KEY) !== '0'; } catch (e) { return true; }
+  }
+  function setSoloHidePref(on) {
+    try { localStorage.setItem(SOLO_HIDE_KEY, on ? '1' : '0'); } catch (e) {}
+  }
+
+  /** 判断一个节点像不像播放器控制条（进度条/音量/按钮）。命中的不隐藏。 */
+  const SOLO_CONTROL_SEL = [
+    '[class*="control" i]', '[class*="progress" i]', '[class*="slider" i]',
+    '[class*="seek" i]', '[class*="timeline" i]', '[class*="playbar" i]',
+    '[class*="danmaku" i]', '[class*="subtitle" i]',
+    'input[type="range"]', '[role="slider"]',
+  ].join(',');
+
+  function looksLikePlayerControls(el) {
+    if (!el || !el.querySelectorAll || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.height > window.innerHeight * 0.5) return false; // 大容器不动（避免把整页留下）
+    if (r.width < 80 || r.height < 8) return false;
+    // 控制条几乎总在画面下半部分；顶部条多半是站点导航，照旧隐藏
+    if (window.innerHeight && r.top < window.innerHeight * 0.35) return false;
+    try {
+      if (el.matches && el.matches(SOLO_CONTROL_SEL)) return true;
+      return !!el.querySelector(SOLO_CONTROL_SEL);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 被保留的控制条要能压在铺满的视频之上 */
+  function raiseAboveVideo(el) {
+    try {
+      const pos = window.getComputedStyle ? window.getComputedStyle(el).position : 'static';
+      if (!pos || pos === 'static') soloSet(el, 'position', 'relative');
+      soloSet(el, 'z-index', '2147483601');
+      soloSet(el, 'pointer-events', 'auto');
+    } catch (e) {}
+  }
+
   /** el -> 修改前的 style.cssText，用于精确还原 */
   const soloSaved = new Map();
 
@@ -1108,25 +1151,34 @@
       for (const k in SOLO_ANC) soloSet(n, k, SOLO_ANC[k]);
     }
 
-    // 隐藏旁系节点：只留“通往视频的这一条链”
+    // 隐藏旁系节点：只留“通往视频的这一条链”（可在工具条上一键关掉）
     let hidden = 0;
-    for (let n = el; n && n !== document.documentElement; n = soloParent(n)) {
-      const p = soloParent(n);
-      if (!p) break;
-      for (const sib of Array.from(p.children)) {
-        if (sib === n) continue;
-        const tag = sib.tagName;
-        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'TEMPLATE') continue;
-        const sid = sib.id || '';
-        if (sid.indexOf('__multipip__') === 0 || sid.indexOf('mp-solo') === 0) continue;
-        soloSet(sib, 'display', 'none');
-        hidden++;
+    let keptControls = 0;
+    if (soloHidePref()) {
+      for (let n = el; n && n !== document.documentElement; n = soloParent(n)) {
+        const p = soloParent(n);
+        if (!p) break;
+        for (const sib of Array.from(p.children)) {
+          if (sib === n) continue;
+          const tag = sib.tagName;
+          if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'TEMPLATE') continue;
+          const sid = sib.id || '';
+          if (sid.indexOf('__multipip__') === 0 || sid.indexOf('mp-solo') === 0) continue;
+          // 播放器控制条（进度条/音量/弹幕层）保留，并抬到铺满的视频之上
+          if (looksLikePlayerControls(sib)) {
+            raiseAboveVideo(sib);
+            keptControls++;
+            continue;
+          }
+          soloSet(sib, 'display', 'none');
+          hidden++;
+        }
       }
     }
 
     soloSet(document.documentElement, 'overflow', 'hidden');
     if (document.body) soloSet(document.body, 'overflow', 'hidden');
-    return hidden;
+    return { hidden, keptControls };
   }
 
   /** 向上找一层“播放器容器”（含控制条/弹幕层），但不把带评论/侧栏的整页容器当视频容器。 */
@@ -1190,6 +1242,7 @@
 
   function hideBodyExceptStage(stage) {
     if (!document.body) return;
+    if (!soloHidePref()) return; // 用户关掉了"隐藏页面"：舞台本身就是不透明全屏，无需再藏
     for (const child of Array.from(document.body.children)) {
       if (child === stage) continue;
       const sid = child.id || '';
@@ -1227,11 +1280,12 @@
 
   function applySoloIsolation(video) {
     const target = soloTargetNode(video);
-    const hidden = soloFillViewport(target);
+    const info = soloFillViewport(target);
     const inFrame = window.self !== window.top;
     log('solo isolate:', target.tagName + '.' + (target.className || '').toString().slice(0, 40),
       'rect=', target.getBoundingClientRect().width + 'x' + target.getBoundingClientRect().height,
-      'hiddenSiblings=', hidden, 'inFrame=', inFrame);
+      'hiddenSiblings=', info.hidden, 'keptControls=', info.keptControls,
+      'hidePref=', soloHidePref(), 'inFrame=', inFrame);
 
     // 视频在跨域 iframe 里：让顶层把承载它的 <iframe> 也铺满
     if (inFrame) {
@@ -1331,6 +1385,17 @@
       bgSend({ type: 'mp-solo-resize', token, aspect: hooks && hooks.aspect ? hooks.aspect() : 0 });
     });
 
+    let hideOn = soloHidePref();
+    const hideBtn = mkBtn(hideOn ? '◉ 已隐藏页面' : '○ 不隐藏页面', '切换是否隐藏视频之外的页面内容（隐藏后可能会把播放控制条也藏掉，那就点它关掉）');
+    hideBtn.onclick = () => {
+      const next = !hideOn;
+      setSoloHidePref(next);
+      hideOn = next;
+      hideBtn.textContent = next ? '◉ 已隐藏页面' : '○ 不隐藏页面';
+      if (hooks && typeof hooks.repave === 'function') hooks.repave();
+      toast(next ? '已隐藏页面内容' : '已显示页面内容（控制条应该回来了）', 2400);
+    };
+
     let cutOn = !!(hooks && hooks.cutPref);
     const cut = mkBtn(cutOn ? '✂ 已裁边' : '✂ 裁边', '切换是否裁掉 Chrome 工具栏（真无边框）');
     cut.onclick = () => {
@@ -1362,6 +1427,7 @@
     bar.appendChild(grip);
     bar.appendChild(sizeGrip);
     bar.appendChild(cut);
+    bar.appendChild(hideBtn);
     bar.appendChild(repave);
     bar.appendChild(pin);
     bar.appendChild(recall);
