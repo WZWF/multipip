@@ -1296,6 +1296,57 @@
     return target;
   }
 
+  /* 诊断：在页面控制台执行
+   *   document.dispatchEvent(new CustomEvent('mp-solo-debug'))
+   * 会打印当前拆窗的隔离目标、视频与"疑似控制条"的可见性/位置，用来定位控制条去哪了。 */
+  document.addEventListener('mp-solo-debug', () => {
+    try {
+      const out = [];
+      for (const [video, rec] of soloPopped) {
+        const vr = video.getBoundingClientRect ? video.getBoundingClientRect() : null;
+        const vs = window.getComputedStyle(video);
+        out.push({
+          what: 'video',
+          rect: vr ? [Math.round(vr.left), Math.round(vr.top), Math.round(vr.width), Math.round(vr.height)] : null,
+          display: vs.display, visibility: vs.visibility, opacity: vs.opacity, zIndex: vs.zIndex,
+        });
+        if (rec.stage) {
+          const r = rec.stage.getBoundingClientRect();
+          out.push({ what: 'stage', rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] });
+        }
+        let target = soloTargetNode(video);
+        if (target) {
+          const r = target.getBoundingClientRect();
+          out.push({
+            what: 'target', tag: target.tagName + '.' + String(target.className || '').slice(0, 40),
+            rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+          });
+        }
+        // 全文档扫一遍"疑似控制条"，看它们到底是被隐藏、被覆盖，还是压根不在文档里
+        const nodes = document.querySelectorAll(SOLO_CONTROL_SEL);
+        let shown = 0;
+        for (const el of nodes) {
+          if (shown >= 12) break;
+          const r = el.getBoundingClientRect();
+          if (!r.width && !r.height) continue;
+          const cs = window.getComputedStyle(el);
+          out.push({
+            what: 'control', tag: el.tagName + '.' + String(el.className || '').slice(0, 36),
+            rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+            display: cs.display, visibility: cs.visibility, opacity: cs.opacity, zIndex: cs.zIndex,
+            inTarget: target ? target.contains(el) : false,
+          });
+          shown++;
+        }
+        out.push({ what: 'flags', hint: 'hidden', hidePref: soloHidePref(), adopted: !!rec.adopted, token: rec.token });
+      }
+      console.log('[Multi-PiP] solo debug', out);
+      if (!out.length) console.log('[Multi-PiP] solo debug: 当前没有拆窗中的视频');
+    } catch (e) {
+      console.log('[Multi-PiP] solo debug failed', e && e.message);
+    }
+  }, false);
+
   // 顶层帧：收到子帧求助后，把承载它的 <iframe> 元素本身铺满视口
   window.addEventListener('message', (ev) => {
     const d = ev && ev.data;
@@ -1460,6 +1511,165 @@
     };
   }
 
+  /** 拆窗自带的播放条：不依赖站点 DOM，所以站点怎么排版都不会丢。
+   *  底部一条：播放/暂停 · 进度条 · 时间 · 音量 · 倍速。鼠标静止 2s 自动淡出。 */
+  function buildSoloPlaybar(video, token) {
+    const wrap = document.createElement('div');
+    wrap.id = 'mp-solo-playbar';
+    Object.assign(wrap.style, {
+      position: 'fixed', left: '0', right: '0', bottom: '0', zIndex: '2147483646',
+      display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 10px',
+      background: 'linear-gradient(180deg, rgba(0,0,0,0), rgba(0,0,0,.78) 42%)',
+      font: '12px/1 system-ui, "Segoe UI", sans-serif', color: '#fff',
+      opacity: '0', transition: 'opacity .18s', pointerEvents: 'none', userSelect: 'none',
+    });
+
+    const mkBtn = (label, title, w) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.title = title;
+      Object.assign(b.style, {
+        cursor: 'pointer', border: 'none', background: 'rgba(255,255,255,.12)',
+        color: '#fff', borderRadius: '6px', padding: '4px 8px', font: 'inherit',
+        minWidth: (w || 0) + 'px', whiteSpace: 'nowrap',
+      });
+      return b;
+    };
+
+    const playBtn = mkBtn('\u23f8', '\u64ad\u653e / \u6682\u505c', 30);
+    const timeText = document.createElement('span');
+    timeText.style.cssText = 'opacity:.9;white-space:nowrap;font-variant-numeric:tabular-nums;';
+    const seek = document.createElement('input');
+    seek.type = 'range';
+    seek.min = '0';
+    seek.max = '1000';
+    seek.value = '0';
+    seek.title = '\u62d6\u52a8\u8fdb\u5ea6';
+    Object.assign(seek.style, { flex: '1', minWidth: '80px', cursor: 'pointer', accentColor: '#6d5cff' });
+
+    const volBtn = mkBtn('\U0001f50a', '\u9759\u97f3 / \u6062\u590d', 30);
+    const vol = document.createElement('input');
+    vol.type = 'range';
+    vol.min = '0';
+    vol.max = '100';
+    vol.value = String(Math.round((video.volume != null ? video.volume : 1) * 100));
+    vol.title = '\u97f3\u91cf';
+    Object.assign(vol.style, { width: '64px', cursor: 'pointer', accentColor: '#6d5cff' });
+
+    const rateBtn = mkBtn('1\u00d7', '\u5faa\u73af\u5207\u6362\u500d\u901f', 40);
+
+    wrap.appendChild(playBtn);
+    wrap.appendChild(timeText);
+    wrap.appendChild(seek);
+    wrap.appendChild(volBtn);
+    wrap.appendChild(vol);
+    wrap.appendChild(rateBtn);
+
+    let scrubbing = false;
+
+    const sync = () => {
+      try {
+        const cur = video.currentTime || 0;
+        const dur = Number.isFinite(video.duration) ? video.duration : 0;
+        if (!scrubbing) seek.value = String(dur > 0 ? Math.round((cur / dur) * 1000) : 0);
+        timeText.textContent = fmtTime(cur) + ' / ' + fmtTime(dur);
+        playBtn.textContent = video.paused ? '\u25b6' : '\u23f8';
+        volBtn.textContent = (video.muted || video.volume === 0) ? '\U0001f507' : '\U0001f50a';
+        rateBtn.textContent = (video.playbackRate || 1) + '\u00d7';
+      } catch (e) {}
+    };
+
+    playBtn.onclick = () => {
+      try {
+        if (video.paused) {
+          const p = video.play();
+          if (p && p.catch) p.catch(() => {});
+        } else {
+          video.pause();
+        }
+      } catch (e) {}
+      sync();
+    };
+
+    seek.addEventListener('input', () => {
+      scrubbing = true;
+      try {
+        const dur = Number.isFinite(video.duration) ? video.duration : 0;
+        if (dur > 0) timeText.textContent = fmtTime((Number(seek.value) / 1000) * dur) + ' / ' + fmtTime(dur);
+      } catch (e) {}
+    });
+    seek.addEventListener('change', () => {
+      try {
+        const dur = Number.isFinite(video.duration) ? video.duration : 0;
+        const t = (Number(seek.value) / 1000) * dur;
+        if (dur > 0 && Number.isFinite(t)) video.currentTime = Math.max(0, Math.min(dur - 0.05, t));
+      } catch (e) {}
+      scrubbing = false;
+      sync();
+    });
+    // 有些播放器只认 pointerup，补一条
+    seek.addEventListener('pointerup', () => {
+      if (scrubbing) seek.dispatchEvent(new Event('change'));
+    });
+
+    const applyVolume = () => {
+      const v = Math.max(0, Math.min(100, Number(vol.value) || 0)) / 100;
+      try {
+        video.muted = v === 0;
+        video.volume = v;
+      } catch (e) {}
+      sync();
+    };
+    vol.addEventListener('input', applyVolume);
+    volBtn.onclick = () => {
+      try { video.muted = !video.muted; } catch (e) {}
+      vol.value = String(Math.round((video.muted ? 0 : (video.volume || 1)) * 100));
+      sync();
+    };
+    rateBtn.onclick = () => {
+      const rates = SPEED_RATES;
+      const cur = video.playbackRate || 1;
+      let idx = rates.findIndex((r) => Math.abs(r - cur) < 0.01);
+      if (idx < 0) idx = rates.indexOf(1);
+      try { video.playbackRate = rates[(idx + 1) % rates.length]; } catch (e) {}
+      sync();
+    };
+
+    const events = ['timeupdate', 'play', 'pause', 'durationchange', 'volumechange', 'ratechange', 'seeking', 'seeked', 'loadedmetadata'];
+    events.forEach((ev) => { try { video.addEventListener(ev, sync); } catch (e) {} });
+
+    let hideTimer = null;
+    const show = () => {
+      wrap.style.opacity = '1';
+      wrap.style.pointerEvents = 'auto';
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => {
+        if (wrap.matches(':hover') || scrubbing) return;
+        wrap.style.opacity = '0';
+        wrap.style.pointerEvents = 'none';
+      }, 2000);
+    };
+    wrap.addEventListener('mouseenter', show);
+    wrap.addEventListener('mouseleave', show);
+    const onMove = (ev) => {
+      if (ev.clientY > window.innerHeight - 120) show();
+    };
+    document.addEventListener('mousemove', onMove, true);
+
+    (document.body || document.documentElement).appendChild(wrap);
+    sync();
+    show();
+
+    return {
+      remove() {
+        events.forEach((ev) => { try { video.removeEventListener(ev, sync); } catch (e) {} });
+        document.removeEventListener('mousemove', onMove, true);
+        if (hideTimer) clearTimeout(hideTimer);
+        wrap.remove();
+      },
+    };
+  }
+
   /** 原生拆窗：把视频所在的标签页整体挑进置顶 popup 窗口，页面本身直接铺满。
    *  零重编码、零拷贝、支持 DRM；多开等价于多开普通标签页（各自硬件解码）。 */
   async function popOutSolo(video) {
@@ -1568,7 +1778,9 @@
     }, 1200);
     rec.guard = guard;
 
+    const playbar = buildSoloPlaybar(video, token);
     rec.bar = bar;
+    rec.playbar = playbar;
     rec.titleObserver = titleObserver;
     rec.reapply = reapply;
     soloPopped.set(video, rec);
@@ -1595,6 +1807,7 @@
       if (rec.titleObserver) { try { rec.titleObserver.disconnect(); } catch (e) {} }
       if (rec.reapply) { try { window.removeEventListener('resize', rec.reapply); } catch (e) {} }
       if (rec.guard) { try { clearInterval(rec.guard); } catch (e) {} }
+      if (rec.playbar) { try { rec.playbar.remove(); } catch (e) {} }
       if (rec.bar) { try { rec.bar.remove(); } catch (e) {} }
       try {
         if (document.title.indexOf(rec.token) === 0) document.title = rec.origTitle;
