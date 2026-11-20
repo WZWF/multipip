@@ -1023,7 +1023,6 @@
 
   /** video -> { token, origTitle, bar } */
   const soloPopped = new Map();
-  let soloActiveToken = '';
 
   /** 裁边（SetWindowRgn 切掉 Chrome 工具栏）默认开启，可在工具条上一键关掉 */
   const SOLO_CUT_KEY = NS + ':cut';
@@ -1420,7 +1419,6 @@
       return;
     }
 
-    soloActiveToken = token;
     const rec = { token, origTitle, bar: null, titleObserver: null, reapply: null, adopted: false, stage: null };
 
     // 先探测容器：若它明显不是"整屏播放器"（或该站点上次用过兜底），直接走 adopt
@@ -1528,7 +1526,6 @@
       soloRestoreAll();
       const st = document.getElementById('mp-solo-style'); // 兼容旧版本注入的样式
       if (st) st.remove();
-      soloActiveToken = '';
     }
     refreshStates();
   }
