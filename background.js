@@ -455,28 +455,39 @@ function soloOpen(msg, sender) {
       }
       const originWinId = tab.windowId;
       const originIndex = tab.index;
-      const width = Math.max(240, Math.min(3000, Math.round(Number(msg.width) || 720)));
-      const height = Math.max(140, Math.min(2000, Math.round(Number(msg.height) || 405)));
-      chrome.windows.create({ tabId, type: 'popup', width, height, focused: true }, (win) => {
-        if (chrome.runtime.lastError || !win) {
-          resolve({ ok: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'windows.create failed' });
-          return;
-        }
-        const rec = { winId: win.id, tabId, token, originWinId, originIndex };
-        soloWindows.set(win.id, rec);
-        soloByToken.set(token, rec);
-        soloPersist();
-        // 宿主按 title 里的 token 找窗口，窗口晚于消息出现也能自愈（宿主内部重试 3s）
-        winHostPost({
-          cmd: 'attach',
-          token,
-          topmost: 1,
-          cut: msg.cut ? 1 : 0,
-          radius: Number(msg.radius) || 10,
-        });
-        resolve({ ok: true, winId: win.id, topmost: true, cut: !!msg.cut });
+      // 取一次 origin 窗口信息：incognito 标记用于召回时只在同 profile 里挑窗口
+      chrome.windows.get(originWinId, {}, (originWin) => {
+        const originIncognito = !chrome.runtime.lastError && originWin ? !!originWin.incognito : false;
+        openSoloWindow({ tabId, token, originWinId, originIndex, originIncognito, msg, resolve });
       });
     });
+  });
+}
+
+/** origin 窗口只有这一个标签页时，标签页被搬走后 Chrome 会自动关掉它；
+ *  所以 originWinId 可能已经失效 —— 召回一律先校验。 */
+function openSoloWindow(ctx) {
+  const { tabId, token, originWinId, originIndex, originIncognito, msg, resolve } = ctx;
+  const width = Math.max(240, Math.min(3000, Math.round(Number(msg.width) || 720)));
+  const height = Math.max(140, Math.min(2000, Math.round(Number(msg.height) || 405)));
+  chrome.windows.create({ tabId, type: 'popup', width, height, focused: true }, (win) => {
+    if (chrome.runtime.lastError || !win) {
+      resolve({ ok: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'windows.create failed' });
+      return;
+    }
+    const rec = { winId: win.id, tabId, token, originWinId, originIndex, incognito: originIncognito };
+    soloWindows.set(win.id, rec);
+    soloByToken.set(token, rec);
+    soloPersist();
+    // 宿主按 title 里的 token 找窗口，窗口晚于消息出现也能自愈（宿主内部重试 3s）
+    winHostPost({
+      cmd: 'attach',
+      token,
+      topmost: 1,
+      cut: msg.cut ? 1 : 0,
+      radius: Number(msg.radius) || 10,
+    });
+    resolve({ ok: true, winId: win.id, topmost: true, cut: !!msg.cut });
   });
 }
 
@@ -487,7 +498,10 @@ function soloByTabId(tabId) {
   return null;
 }
 
-/** 召回：先让页面撤销 CSS 隔离，再把 Tab 原路移回、销毁空的 popup 窗口、取消置顶。 */
+/** 召回：先让页面撤销 CSS 隔离，再把 Tab 移回、销毁空的 popup 窗口、取消置顶。
+ *  目标窗口可能已经不存在（源窗口只有这一个标签页时搬走即自动关闭），也可能
+ *  因为 id 复用落到别的 profile 上（Chrome 会报 "tabs can only be moved between
+ *  Windows in the same profile"），所以这里先校验再逐级兜底。 */
 function soloRecall(rec) {
   if (!rec) return;
   soloWindows.delete(rec.winId);
@@ -497,10 +511,59 @@ function soloRecall(rec) {
   try {
     chrome.tabs.sendMessage(rec.tabId, { type: 'mp-solo-restore', token: rec.token }, () => { void chrome.runtime.lastError; });
   } catch (e) { /* tab gone */ }
-  chrome.tabs.move(rec.tabId, { windowId: rec.originWinId, index: rec.originIndex }, () => {
-    if (chrome.runtime.lastError) return;
-    chrome.windows.remove(rec.winId, () => { void chrome.runtime.lastError; });
+
+  chrome.windows.getAll({ windowTypes: ['normal'] }, (wins) => {
+    if (chrome.runtime.lastError) wins = [];
+    const same = (wins || []).filter((w) => !!w.incognito === !!rec.incognito);
+    const origin = same.find((w) => w.id === rec.originWinId);
+    if (origin) {
+      moveTabBack(rec, origin.id, rec.originIndex);
+    } else if (same.length) {
+      // 原窗口已关闭：退到最近的普通窗口
+      const fallback = same[same.length - 1];
+      moveTabBack(rec, fallback.id, -1);
+    } else {
+      // 一个普通窗口都没有：给它新开一个
+      chrome.windows.create({ tabId: rec.tabId, type: 'normal' }, (win) => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          notifySoloError(rec.tabId, '召回失败：' + err.message);
+          return;
+        }
+        dropSoloPopup(rec, win && win.id);
+      });
+    }
   });
+}
+
+function moveTabBack(rec, windowId, index) {
+  const props = { windowId };
+  if (typeof index === 'number' && index >= 0) props.index = index;
+  chrome.tabs.move(rec.tabId, props, () => {
+    const err = chrome.runtime.lastError && chrome.runtime.lastError.message;
+    if (!err) {
+      dropSoloPopup(rec, windowId);
+      return;
+    }
+    // 目标窗口不可用（profile 不匹配 / 已关闭 / 索引非法）：换一个新窗口收留它
+    chrome.windows.create({ tabId: rec.tabId, type: 'normal' }, () => {
+      const err2 = chrome.runtime.lastError;
+      if (err2) notifySoloError(rec.tabId, '召回失败：' + err2.message);
+      else dropSoloPopup(rec, null);
+    });
+  });
+}
+
+/** 标签页已经搬走，把空的 popup 窗口收掉 */
+function dropSoloPopup(rec, keepWindowId) {
+  if (!rec || rec.winId == null || rec.winId === keepWindowId) return;
+  chrome.windows.remove(rec.winId, () => { void chrome.runtime.lastError; });
+}
+
+function notifySoloError(tabId, message) {
+  try {
+    chrome.tabs.sendMessage(tabId, { type: 'mp-solo-error', message }, () => { void chrome.runtime.lastError; });
+  } catch (e) { /* tab gone */ }
 }
 
 chrome.windows.onRemoved.addListener((winId) => {

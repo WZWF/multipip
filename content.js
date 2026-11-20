@@ -4340,6 +4340,10 @@
         if (hit) teardownSolo(hit);
         return true;
       }
+      if (msg && msg.type === 'mp-solo-error') {
+        toast(String(msg.message || '拆窗操作失败'), 6000);
+        return true;
+      }
       if (msg && msg.type === 'mp-solo-topmost-state') {
         const hit = soloVideoByToken(msg.token);
         const rec = hit ? soloPopped.get(hit) : null;
